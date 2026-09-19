@@ -126,6 +126,16 @@ describe('CodexFlowStore', () => {
     expect(store.getAgentRun(run.id)).toMatchObject({ id: run.id, status: 'COMPLETED' });
     expect(store.listAgentRuns(String(task.id))).toHaveLength(1);
     expect(store.listTaskTimeline(String(task.id))[0]).toMatchObject({ role: 'PLANNER' });
+    const event = store.appendAgentEvent({
+      agentRunId: run.id,
+      type: 'agent.completed',
+      payload: { role: 'PLANNER', safe: true },
+    });
+    expect(store.getAgentEvent(event.id)).toMatchObject({
+      agentRunId: run.id,
+      payload: { role: 'PLANNER', safe: true },
+    });
+    expect(store.listAgentEvents(run.id)).toHaveLength(1);
 
     const plan = store.createPlan({
       taskId: String(task.id),

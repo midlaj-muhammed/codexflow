@@ -7,6 +7,10 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@codexflow/agents": "workspace:*",
+    "@codexflow/database": "workspace:*",
+    "@codexflow/git": "workspace:*",
+    "@codexflow/workspace": "workspace:*",
     "@codexflow/shared": "workspace:*"
   },
   "devDependencies": {

@@ -66,6 +66,14 @@ export type AgentRunRecord = {
   createdAt: string;
   updatedAt: string;
 };
+export type AgentEventRecord = {
+  id: string;
+  agentRunId: string;
+  type: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
 export type PlanRecord = {
   id: string;
   taskId: string;
@@ -102,6 +110,14 @@ const mapAgentRun = (row: Record<string, unknown>): AgentRunRecord => ({
   startedAt: optionalString(row.startedAt),
   finishedAt: optionalString(row.finishedAt),
   error: optionalString(row.error),
+  createdAt: String(row.createdAt),
+  updatedAt: String(row.updatedAt),
+});
+const mapAgentEvent = (row: Record<string, unknown>): AgentEventRecord => ({
+  id: String(row.id),
+  agentRunId: String(row.agentRunId),
+  type: String(row.type),
+  payload: JSON.parse(String(row.payload ?? '{}')) as Record<string, unknown>,
   createdAt: String(row.createdAt),
   updatedAt: String(row.updatedAt),
 });
@@ -171,6 +187,11 @@ const updateAgentRunSchema = z.object({
   status: agentStatusSchema,
   finishedAt: z.string().datetime().optional(),
   error: z.string().optional(),
+});
+const appendAgentEventSchema = z.object({
+  agentRunId: z.string().uuid(),
+  type: z.string().min(1),
+  payload: z.record(z.string(), z.unknown()).default({}),
 });
 const createPlanSchema = z.object({
   taskId: z.string().uuid(),
@@ -380,6 +401,36 @@ export class CodexFlowStore {
         'SELECT id, task_id AS taskId, workspace_id AS workspaceId, role, status, attempt, started_at AS startedAt, finished_at AS finishedAt, error, created_at AS createdAt, updated_at AS updatedAt FROM agent_runs WHERE task_id = ? ORDER BY created_at',
       )
       .all(taskId) as Record<string, unknown>[]).map(mapAgentRun);
+  }
+  appendAgentEvent(input: {
+    agentRunId: string;
+    type: string;
+    payload?: Record<string, unknown>;
+  }) {
+    const value = appendAgentEventSchema.parse(input);
+    const id = randomUUID(),
+      timestamp = now();
+    this.db
+      .prepare(
+        'INSERT INTO agent_events (id, agent_run_id, type, payload, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(id, value.agentRunId, value.type, JSON.stringify(value.payload), timestamp, timestamp);
+    return this.getAgentEvent(id)!;
+  }
+  getAgentEvent(id: string) {
+    const row = this.db
+      .prepare(
+        'SELECT id, agent_run_id AS agentRunId, type, payload, created_at AS createdAt, updated_at AS updatedAt FROM agent_events WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? mapAgentEvent(row) : undefined;
+  }
+  listAgentEvents(agentRunId: string) {
+    return (this.db
+      .prepare(
+        'SELECT id, agent_run_id AS agentRunId, type, payload, created_at AS createdAt, updated_at AS updatedAt FROM agent_events WHERE agent_run_id = ? ORDER BY created_at',
+      )
+      .all(agentRunId) as Record<string, unknown>[]).map(mapAgentEvent);
   }
   listTaskTimeline(taskId: string) {
     return this.listAgentRuns(taskId);

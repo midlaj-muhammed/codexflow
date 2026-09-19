@@ -20,6 +20,9 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Added Phase 13A runtime foundation contracts without implementing the executor: public SQLite persistence methods now exist for agent runs, plans, and reviews over the existing tables.
 - Extended the existing `CoreAgentPipeline` with typed stage callbacks for Planner, Coder, Reviewer, and Tester. The callbacks are emitted from the real stage execution points and carry the actual stage results.
 - Extended the existing repair loop with typed repair stage callbacks. No second pipeline, event bus, state machine, or database layer was introduced.
+- Added Phase 13B `RuntimeExecutor` inside `packages/runtime`. It loads persisted tasks/projects/repositories, creates or reuses isolated workspaces through `WorkspaceManager`, invokes the existing `CoreAgentPipeline`, persists real stage outputs, forwards agent boundaries through the existing `EventBus`, and stops at the approval boundary.
+- Extended `CoreAgentPipeline` narrowly so RuntimeExecutor can resolve structured coder output after the real planner result exists and can observe the real Git diff before review.
+- Added public `agent_events` store operations over the existing table so safe stage metadata can be persisted with agent runs.
 
 ## Architecture Compliance
 
@@ -28,6 +31,7 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Approval remains backend-enforced. Tokens and environment values are never returned by the APIs.
 - Delivery remains the Phase 10 durable delivery service; the UI only reads its persisted records.
 - Runtime stage observability is callback-based inside the existing agent package so a future RuntimeExecutor can forward those truthful boundaries into the existing `EventBus` using `agent.started`, `agent.completed`, and `agent.failed`.
+- `RuntimeExecutor` now performs that forwarding for real pipeline execution. It does not call `runMockWorkflow`, does not use a mock provider fallback, does not approve tasks, and does not commit, push, or create PRs.
 
 ## Phase 13A Runtime Foundation
 
@@ -39,6 +43,18 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Persistence contracts: `createAgentRun`, `updateAgentRun`, `getAgentRun`, `listAgentRuns`, `createPlan`, `getPlan`, `createReview`, and `getReview`.
 - Test persistence: existing `recordTestRun` and `listTestRuns` remain the authoritative verification record APIs.
 - Workspace and Git diff contracts remain the existing `WorkspaceManager` and `GitEngine.diff()` APIs; neither was replaced.
+
+## Phase 13B RuntimeExecutor
+
+- Public API: `RuntimeExecutor.execute(taskId)`.
+- Production provider: explicit `StructuredCoderProvider`, with `RuntimeExecutor.fromEnvironment(...)` constructing `OpenAIResponsesProvider` only when `OPENAI_API_KEY` is present. Missing provider configuration fails safely with `PROVIDER_NOT_CONFIGURED`.
+- Workspace isolation: new execution uses `WorkspaceManager.createWorkspace(...)`; existing persisted workspaces are reused. Execution never runs directly in the primary repository path.
+- Lifecycle: persisted task state is adopted into `TaskLifecycleManager` through `hydrate`, then transitions through `QUEUED`, `PLANNING`, `CONTEXT_READY`, `CODING`, `REVIEWING`, `TESTING`, and `READY_FOR_APPROVAL` when successful.
+- Persistence: agent runs, agent events, plans, reviews, and test runs are written as the real stage callbacks occur.
+- Failure handling: invalid task/project/repository/provider/workspace/pipeline failures return structured failed results, persist reachable lifecycle failure state, and emit safe failure events.
+- Duplicate execution: prevented in-process by the executor's active task guard. Durable cross-process execution locking is not implemented in Phase 13B.
+- Repair: if the existing pipeline reports `REPAIRING` or `BLOCKED`, RuntimeExecutor truthfully transitions to `BLOCKED`. Provider-backed automated repair remains future work.
+- Approval boundary: successful execution stops at `READY_FOR_APPROVAL`; approval and delivery remain existing later boundaries.
 
 ## User Experience
 
@@ -56,20 +72,25 @@ The dashboard supports importing a local repository, deterministic project scann
 - `pnpm --filter @codexflow/agents typecheck` — PASS.
 - `pnpm --filter @codexflow/agents test` — PASS: 17 tests, including stage boundary success/failure and repair callbacks.
 - `pnpm --filter @codexflow/runtime typecheck` — PASS.
-- `pnpm --filter @codexflow/runtime test` — PASS: 7 tests, including reusable agent boundary event names.
+- `pnpm --filter @codexflow/runtime test` — PASS: 11 tests, including RuntimeExecutor success, failure persistence, missing provider, invalid state, duplicate execution, and reusable agent boundary event names.
+- `pnpm --filter @codexflow/runtime lint` — PASS.
+- `pnpm --filter @codexflow/workspace test` — PASS: 2 tests.
+- `pnpm --filter @codexflow/git test` — PASS: 2 tests.
 
 ## Regression Review
 
 - Phase 10 delivery tests — PASS.
 - Phase 11 provider tests — PASS through `pnpm test`.
 - Phase 12 real GitHub E2E — PASS.
-- No delivery, provider, approval, GitHub, or Phase 10-12 recovery source changes were made for Phase 13A.
+- No delivery, approval, GitHub, or Phase 10-12 recovery source changes were made for Phase 13B.
 
 ## Remaining Blockers
 
-- The existing runtime has no persisted HTTP orchestration bridge that can start a newly created task, create its isolated workspace, invoke configured production agents, and persist the resulting Planner/Coder/Reviewer outputs. The control plane intentionally does not fabricate those stages.
-- Consequently a task created from this UI can be persisted and inspected, but cannot yet be driven end-to-end solely from the browser. Delivery controls are likewise display-only until that existing runtime bridge is exposed.
-- RuntimeExecutor is still intentionally unimplemented after Phase 13A. The next step can now call the existing pipeline with `onStage`, persist actual stage outputs through the new store methods, create/read workspaces through the existing workspace APIs, and forward stage boundaries into the existing runtime `EventBus`.
+- HTTP start/cancel endpoints are still intentionally unimplemented after Phase 13B.
+- The browser is not yet connected to RuntimeExecutor, so a task created from the UI still cannot be started end-to-end from the browser.
+- Real OpenAI E2E through RuntimeExecutor has not yet been executed in this phase; Phase 13B uses an explicitly injected deterministic structured coder provider for repeatable runtime tests.
+- Provider-backed automated repair is not implemented; failed verification is persisted and surfaced as `BLOCKED`.
+- Durable cross-process runtime execution locking is not implemented; duplicate execution prevention is currently in-process.
 
 ## Final Decision
 

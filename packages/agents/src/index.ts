@@ -359,6 +359,7 @@ export type CoderStageResult = {
   modelOutput: CoderModelOutput;
   appliedEdits: FileEdit[];
   changedFiles: string[];
+  diff?: string;
 };
 export type TesterStageResult = {
   tests: TestExecution[];
@@ -382,6 +383,20 @@ type PendingPipelineStageEvent =
   | { stage: PipelineStage; status: 'COMPLETED'; result: PipelineStageResult }
   | { stage: PipelineStage; status: 'FAILED'; error: string };
 export type PipelineStageObserver = (event: PipelineStageEvent) => Promise<void> | void;
+export type CoderOutputResolver = (input: {
+  prompt: string;
+  metadata: ProjectMetadata;
+  workspacePath: string;
+  plan: PlannerResult;
+  attempt: number;
+}) => Promise<CoderModelOutput> | CoderModelOutput;
+export type DiffResolver = (input: CoderStageResult) => Promise<{
+  diff: string;
+  changedFiles: string[];
+}> | {
+  diff: string;
+  changedFiles: string[];
+};
 export class CoreAgentPipeline {
   constructor(
     private readonly planner = new PlannerAgent(),
@@ -394,7 +409,9 @@ export class CoreAgentPipeline {
     prompt: string;
     metadata: ProjectMetadata;
     workspacePath: string;
-    modelOutput: string;
+    modelOutput?: string;
+    resolveCoderOutput?: CoderOutputResolver;
+    resolveDiff?: DiffResolver;
     diff: string;
     changedFiles: string[];
     attempt?: number;
@@ -424,14 +441,36 @@ export class CoreAgentPipeline {
       this.planner.plan({ prompt: input.prompt, metadata: input.metadata }),
     );
     const codeStage = await runStage('CODER', async () => {
-      const modelOutput = coderModelOutputSchema.parse(JSON.parse(input.modelOutput));
+      const modelOutput = input.resolveCoderOutput
+        ? coderModelOutputSchema.parse(
+            await input.resolveCoderOutput({
+              prompt: input.prompt,
+              metadata: input.metadata,
+              workspacePath: input.workspacePath,
+              plan,
+              attempt: input.attempt ?? 1,
+            }),
+          )
+        : coderModelOutputSchema.parse(JSON.parse(input.modelOutput ?? ''));
       const code = await this.coder.applyEdits(input.workspacePath, modelOutput.edits);
-      return { modelOutput, appliedEdits: modelOutput.edits, changedFiles: code.changedFiles };
+      const observed = input.resolveDiff
+        ? await input.resolveDiff({
+            modelOutput,
+            appliedEdits: modelOutput.edits,
+            changedFiles: code.changedFiles,
+          })
+        : { diff: input.diff, changedFiles: code.changedFiles };
+      return {
+        modelOutput,
+        appliedEdits: modelOutput.edits,
+        changedFiles: observed.changedFiles.length ? observed.changedFiles : code.changedFiles,
+        diff: observed.diff,
+      };
     });
     const review = await runStage('REVIEWER', () =>
       this.reviewer.review({
         changedFiles: input.changedFiles.length ? input.changedFiles : codeStage.changedFiles,
-        diff: input.diff,
+        diff: codeStage.diff ?? input.diff,
       }),
     );
     const testStage = await runStage('TESTER', async () => {
@@ -444,6 +483,7 @@ export class CoreAgentPipeline {
       plan,
       code: {
         changedFiles: codeStage.changedFiles,
+        diff: codeStage.diff,
       },
       review,
       tests,

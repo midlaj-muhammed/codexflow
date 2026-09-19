@@ -1,4 +1,20 @@
 import type { AgentRole, TaskStatus } from '@codexflow/shared';
+import {
+  CoreAgentPipeline,
+  OpenAIResponsesProvider,
+  scanProject,
+  type CoderModelOutput,
+  type PipelineStage,
+  type PipelineStageEvent,
+  type PlannerResult,
+  type ProjectMetadata,
+  type ReviewerResult,
+  type StructuredCoderProvider,
+  type TestExecution,
+} from '@codexflow/agents';
+import type { CodexFlowStore } from '@codexflow/database';
+import { GitEngine } from '@codexflow/git';
+import { WorkspaceManager, type Workspace } from '@codexflow/workspace';
 
 export type Permission = 'READ' | 'WRITE' | 'EXECUTE' | 'CONTROL';
 export type DeliveryStatus =
@@ -111,6 +127,10 @@ export class TaskLifecycleManager {
   private states = new Map<string, TaskStatus>();
   private deliveryStates = new Map<string, DeliveryStatus>();
   constructor(private readonly persistence?: RuntimePersistence) {}
+  hydrate(taskId: string, status: TaskStatus) {
+    this.states.set(taskId, status);
+    return status;
+  }
   async create(taskId: string) {
     this.states.set(taskId, 'CREATED');
     await this.persistence?.saveTaskState(taskId, 'CREATED');
@@ -224,6 +244,602 @@ export class CommandBus {
   }
   private publish(type: RuntimeEventType, taskId: string, payload?: Record<string, unknown>) {
     return this.events.emit({ type, taskId, payload, at: new Date().toISOString() });
+  }
+}
+
+type StoreTask = {
+  id: string;
+  projectId: string;
+  prompt: string;
+  status: TaskStatus;
+};
+type StoreProject = {
+  id: string;
+  repositoryId: string;
+  name: string;
+  metadata?: Record<string, unknown>;
+};
+type StoreRepository = {
+  id: string;
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  localPath?: string;
+};
+type PersistedWorkspace = {
+  id: string;
+  taskId: string;
+  rootPath: string;
+  branch: string;
+  baselineCommit: string;
+  status: string;
+};
+type RuntimeExecutionStageStatus = 'STARTED' | 'COMPLETED' | 'FAILED';
+export type RuntimeExecutionStage = {
+  stage: PipelineStage;
+  role: AgentRole;
+  status: RuntimeExecutionStageStatus;
+  agentRunId?: string;
+  error?: string;
+};
+export type RuntimeExecutionResult = {
+  taskId: string;
+  status: 'SUCCEEDED' | 'FAILED' | 'BLOCKED';
+  finalState?: TaskStatus;
+  workspace?: {
+    id: string;
+    rootPath: string;
+    branch: string;
+    baselineCommit: string;
+  };
+  stages: RuntimeExecutionStage[];
+  changedFiles: string[];
+  diff?: string;
+  review?: ReviewerResult;
+  tests: TestExecution[];
+  repairAttempts: number;
+  error?: {
+    code: string;
+    message: string;
+  };
+};
+export class RuntimeExecutorError extends Error {
+  constructor(
+    public readonly code:
+      | 'TASK_NOT_FOUND'
+      | 'PROJECT_NOT_FOUND'
+      | 'REPOSITORY_NOT_FOUND'
+      | 'REPOSITORY_NOT_CONFIGURED'
+      | 'INVALID_TASK_STATE'
+      | 'DUPLICATE_EXECUTION'
+      | 'PROVIDER_NOT_CONFIGURED'
+      | 'WORKSPACE_ERROR'
+      | 'PIPELINE_FAILED'
+      | 'REPAIR_REQUIRED',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+export type RuntimeExecutorOptions = {
+  store: CodexFlowStore;
+  provider?: StructuredCoderProvider;
+  lifecycle?: TaskLifecycleManager;
+  events?: EventBus;
+  workspaceManager?: WorkspaceManager;
+  git?: GitEngine;
+  pipeline?: CoreAgentPipeline;
+};
+
+const stageRoles: Record<PipelineStage, AgentRole> = {
+  PLANNER: 'PLANNER',
+  CODER: 'CODER',
+  REVIEWER: 'REVIEWER',
+  TESTER: 'TESTER',
+  REPAIR: 'REPAIR',
+};
+const startableStates = new Set<TaskStatus>(['CREATED', 'QUEUED']);
+const agentEventTypes: Record<RuntimeExecutionStageStatus, RuntimeEventType> = {
+  STARTED: 'agent.started',
+  COMPLETED: 'agent.completed',
+  FAILED: 'agent.failed',
+};
+
+export class RuntimeExecutor {
+  private readonly store: CodexFlowStore;
+  private readonly provider?: StructuredCoderProvider;
+  private readonly lifecycle: TaskLifecycleManager;
+  private readonly events: EventBus;
+  private readonly workspaceManager: WorkspaceManager;
+  private readonly git: GitEngine;
+  private readonly pipeline: CoreAgentPipeline;
+  private readonly activeTasks = new Set<string>();
+
+  constructor(options: RuntimeExecutorOptions) {
+    this.store = options.store;
+    this.provider = options.provider;
+    this.lifecycle =
+      options.lifecycle ??
+      new TaskLifecycleManager({
+        saveTaskState: (taskId, status) => {
+          this.store.transitionTask(taskId, status);
+        },
+        saveDeliveryState: (taskId, status, error) => {
+          this.store.setTaskDeliveryStatus(taskId, status, error);
+        },
+        appendEvent: () => {},
+      });
+    this.events = options.events ?? new EventBus();
+    this.workspaceManager = options.workspaceManager ?? new WorkspaceManager();
+    this.git = options.git ?? new GitEngine();
+    this.pipeline = options.pipeline ?? new CoreAgentPipeline();
+  }
+
+  static fromEnvironment(options: Omit<RuntimeExecutorOptions, 'provider'>) {
+    const apiKey = process.env.OPENAI_API_KEY;
+    return new RuntimeExecutor({
+      ...options,
+      provider: apiKey ? new OpenAIResponsesProvider(apiKey) : undefined,
+    });
+  }
+
+  async execute(taskId: string): Promise<RuntimeExecutionResult> {
+    if (this.activeTasks.has(taskId))
+      return this.failed(
+        taskId,
+        [],
+        new RuntimeExecutorError('DUPLICATE_EXECUTION', `Task is already executing: ${taskId}`),
+      );
+    this.activeTasks.add(taskId);
+    const stages: RuntimeExecutionStage[] = [];
+    let currentState: TaskStatus | undefined;
+    let workspace: PersistedWorkspace | undefined;
+    let changedFiles: string[] = [];
+    let diff = '';
+    let review: ReviewerResult | undefined;
+    let tests: TestExecution[] = [];
+    const stageRuns = new Map<PipelineStage, string>();
+
+    try {
+      const task = this.loadTask(taskId);
+      if (!startableStates.has(task.status))
+        throw new RuntimeExecutorError(
+          'INVALID_TASK_STATE',
+          `Task ${taskId} cannot execute from ${task.status}`,
+        );
+      currentState = this.lifecycle.hydrate(taskId, task.status);
+      if (currentState === 'CREATED')
+        currentState = await this.transition(taskId, currentState, 'QUEUED');
+      await this.events.emit({ type: 'task.started', taskId, at: new Date().toISOString() });
+      currentState = await this.transition(taskId, currentState, 'PLANNING');
+
+      const project = this.loadProject(task.projectId);
+      const repository = this.loadRepository(project.repositoryId);
+      if (!repository.localPath)
+        throw new RuntimeExecutorError(
+          'REPOSITORY_NOT_CONFIGURED',
+          `Repository ${repository.id} does not have a local path`,
+        );
+      if (!this.provider)
+        throw new RuntimeExecutorError(
+          'PROVIDER_NOT_CONFIGURED',
+          'Structured coder provider is not configured',
+        );
+
+      workspace = await this.resolveWorkspace(task.id, repository);
+      await this.events.emit({
+        type: 'workspace.created',
+        taskId,
+        at: new Date().toISOString(),
+        payload: {
+          workspaceId: workspace.id,
+          branch: workspace.branch,
+          baselineCommit: workspace.baselineCommit,
+        },
+      });
+
+      const metadata = await this.loadProjectMetadata(workspace.rootPath, project);
+      const result = await this.pipeline.run({
+        prompt: task.prompt,
+        metadata,
+        workspacePath: workspace.rootPath,
+        resolveCoderOutput: ({ plan, attempt }) =>
+          this.runCoderProvider(task, workspace!, metadata, plan, attempt, stageRuns.get('CODER')),
+        resolveDiff: async () => {
+          const [diffResult, changedResult] = await Promise.all([
+            this.git.diff(workspace!.rootPath),
+            this.git.changedFiles(workspace!.rootPath),
+          ]);
+          diff = diffResult.stdout;
+          changedFiles = changedResult.stdout
+            .split('\n')
+            .map((file) => file.trim())
+            .filter(Boolean);
+          return { diff, changedFiles };
+        },
+        diff,
+        changedFiles,
+        onStage: async (event) => {
+          currentState = await this.handleStage(
+            taskId,
+            workspace!,
+            event,
+            currentState!,
+            stageRuns,
+            stages,
+          );
+        },
+      });
+      changedFiles = result.code.changedFiles;
+      diff = result.code.diff ?? diff;
+      review = result.review;
+      tests = result.tests;
+
+      if (result.next === 'READY_FOR_APPROVAL') {
+        currentState = await this.transition(taskId, currentState!, 'READY_FOR_APPROVAL');
+        await this.events.emit({ type: 'approval.required', taskId, at: new Date().toISOString() });
+        return {
+          taskId,
+          status: 'SUCCEEDED',
+          finalState: currentState,
+          workspace: this.publicWorkspace(workspace),
+          stages,
+          changedFiles,
+          diff,
+          review,
+          tests,
+          repairAttempts: 0,
+        };
+      }
+
+      currentState = await this.transition(taskId, currentState!, 'REPAIRING');
+      currentState = await this.transition(taskId, currentState, 'BLOCKED');
+      throw new RuntimeExecutorError(
+        'REPAIR_REQUIRED',
+        'Pipeline requires repair; provider-backed repair is not implemented in RuntimeExecutor yet',
+      );
+    } catch (error) {
+      const failure =
+        error instanceof RuntimeExecutorError
+          ? error
+          : new RuntimeExecutorError(
+              workspace ? 'PIPELINE_FAILED' : 'WORKSPACE_ERROR',
+              error instanceof Error ? error.message : 'Runtime execution failed',
+            );
+      if (currentState && currentState !== 'FAILED' && currentState !== 'BLOCKED') {
+        currentState = await this.failLifecycle(taskId, currentState);
+      }
+      await this.events.emit({
+        type: 'agent.failed',
+        taskId,
+        at: new Date().toISOString(),
+        payload: { error: failure.message, code: failure.code },
+      });
+      return this.failed(taskId, stages, failure, currentState, workspace, changedFiles, diff, review, tests);
+    } finally {
+      this.activeTasks.delete(taskId);
+    }
+  }
+
+  private loadTask(taskId: string): StoreTask {
+    const task = this.store.getTask(taskId) as Record<string, unknown> | undefined;
+    if (!task) throw new RuntimeExecutorError('TASK_NOT_FOUND', `Task not found: ${taskId}`);
+    return {
+      id: String(task.id),
+      projectId: String(task.projectId),
+      prompt: String(task.prompt),
+      status: task.status as TaskStatus,
+    };
+  }
+
+  private loadProject(projectId: string): StoreProject {
+    const project = this.store.getProject(projectId) as Record<string, unknown> | undefined;
+    if (!project)
+      throw new RuntimeExecutorError('PROJECT_NOT_FOUND', `Project not found: ${projectId}`);
+    return {
+      id: String(project.id),
+      repositoryId: String(project.repositoryId),
+      name: String(project.name),
+      metadata: (project.metadata as Record<string, unknown>) ?? {},
+    };
+  }
+
+  private loadRepository(repositoryId: string): StoreRepository {
+    const repository = this.store.getRepository(repositoryId) as Record<string, unknown> | undefined;
+    if (!repository)
+      throw new RuntimeExecutorError(
+        'REPOSITORY_NOT_FOUND',
+        `Repository not found: ${repositoryId}`,
+      );
+    return {
+      id: String(repository.id),
+      owner: String(repository.owner),
+      name: String(repository.name),
+      defaultBranch: String(repository.defaultBranch),
+      localPath: repository.localPath ? String(repository.localPath) : undefined,
+    };
+  }
+
+  private async resolveWorkspace(taskId: string, repository: StoreRepository) {
+    const persisted = this.store.getWorkspaceForTask(taskId) as Record<string, unknown> | undefined;
+    if (persisted) return this.mapWorkspace(persisted);
+    const workspace = await this.workspaceManager.createWorkspace({
+      repositoryPath: repository.localPath!,
+      taskId,
+      baseBranch: repository.defaultBranch,
+    });
+    const record = this.store.createWorkspace(
+      taskId,
+      workspace.rootPath,
+      workspace.branch,
+      workspace.baselineCommit,
+    );
+    return this.mapWorkspace(record);
+  }
+
+  private mapWorkspace(row: Record<string, unknown> | Workspace): PersistedWorkspace {
+    return {
+      id: String(row.id),
+      taskId: String(row.taskId),
+      rootPath: String(row.rootPath),
+      branch: String(row.branch),
+      baselineCommit: String(row.baselineCommit),
+      status: String(row.status),
+    };
+  }
+
+  private async loadProjectMetadata(
+    workspacePath: string,
+    project: StoreProject,
+  ): Promise<ProjectMetadata> {
+    const scanned = await scanProject(workspacePath);
+    return { ...scanned, ...(project.metadata as Partial<ProjectMetadata>) };
+  }
+
+  private async runCoderProvider(
+    task: StoreTask,
+    workspace: PersistedWorkspace,
+    metadata: ProjectMetadata,
+    plan: PlannerResult,
+    attempt: number,
+    runId?: string,
+  ): Promise<CoderModelOutput> {
+    if (!this.provider)
+      throw new RuntimeExecutorError(
+        'PROVIDER_NOT_CONFIGURED',
+        'Structured coder provider is not configured',
+      );
+    return this.provider.runCoder({
+      runId: runId ?? `${task.id}:coder:${attempt}`,
+      taskId: task.id,
+      workspacePath: workspace.rootPath,
+      role: 'CODER',
+      prompt: [
+        `Task: ${task.prompt}`,
+        `Workspace branch: ${workspace.branch}`,
+        `Project languages: ${metadata.language.join(', ') || 'unknown'}`,
+        `Plan summary: ${plan.summary}`,
+        `Expected behavior: ${plan.expectedBehavior}`,
+        `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
+        'Return complete file contents for each changed file as structured edits.',
+      ].join('\n'),
+    });
+  }
+
+  private async handleStage(
+    taskId: string,
+    workspace: PersistedWorkspace,
+    event: PipelineStageEvent,
+    currentState: TaskStatus,
+    stageRuns: Map<PipelineStage, string>,
+    stages: RuntimeExecutionStage[],
+  ) {
+    const role = stageRoles[event.stage];
+    if (event.status === 'STARTED') {
+      const agentRun = this.store.createAgentRun({
+        taskId,
+        workspaceId: workspace.id,
+        role,
+        attempt: 1,
+      });
+      stageRuns.set(event.stage, agentRun.id);
+      stages.push({ stage: event.stage, role, status: event.status, agentRunId: agentRun.id });
+      await this.publishAgentEvent(taskId, event, agentRun.id, role);
+      return this.transitionForStageStart(taskId, currentState, event.stage);
+    }
+
+    const agentRunId = stageRuns.get(event.stage);
+    if (agentRunId) {
+      this.store.updateAgentRun(agentRunId, {
+        status: event.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED',
+        error: event.status === 'FAILED' ? event.error : undefined,
+      });
+      this.store.appendAgentEvent({
+        agentRunId,
+        type: agentEventTypes[event.status],
+        payload: this.safeStagePayload(event),
+      });
+    }
+    stages.push({
+      stage: event.stage,
+      role,
+      status: event.status,
+      agentRunId,
+      error: event.status === 'FAILED' ? event.error : undefined,
+    });
+    await this.publishAgentEvent(taskId, event, agentRunId, role);
+
+    if (event.status === 'COMPLETED') {
+      this.persistStageResult(taskId, agentRunId, event);
+      if (event.stage === 'PLANNER') return this.transition(taskId, currentState, 'CONTEXT_READY');
+    }
+    return currentState;
+  }
+
+  private async transitionForStageStart(taskId: string, current: TaskStatus, stage: PipelineStage) {
+    if (stage === 'CODER') return this.transition(taskId, current, 'CODING');
+    if (stage === 'REVIEWER') return this.transition(taskId, current, 'REVIEWING');
+    if (stage === 'TESTER') return this.transition(taskId, current, 'TESTING');
+    if (stage === 'REPAIR') return this.transition(taskId, current, 'REPAIRING');
+    return current;
+  }
+
+  private persistStageResult(
+    taskId: string,
+    agentRunId: string | undefined,
+    event: Extract<PipelineStageEvent, { status: 'COMPLETED' }>,
+  ) {
+    if (event.stage === 'PLANNER') {
+      const result = event.result as PlannerResult;
+      this.store.createPlan({
+        taskId,
+        agentRunId,
+        content: result.summary,
+        affectedFiles: result.affectedFiles,
+        risks: result.riskSignals,
+      });
+    }
+    if (event.stage === 'REVIEWER') {
+      const result = event.result as ReviewerResult;
+      this.store.createReview({
+        taskId,
+        agentRunId,
+        verdict: result.verdict,
+        findings: result.findings,
+      });
+    }
+    if (event.stage === 'TESTER') {
+      const result = event.result as { tests: TestExecution[] };
+      for (const test of result.tests)
+        this.store.recordTestRun({
+          taskId,
+          command: test.command,
+          status: test.status,
+          exitCode: test.exitCode,
+          stdout: test.stdout,
+          stderr: test.stderr,
+          durationMs: test.durationMs,
+        });
+    }
+  }
+
+  private async publishAgentEvent(
+    taskId: string,
+    event: PipelineStageEvent,
+    agentRunId: string | undefined,
+    role: AgentRole,
+  ) {
+    await this.events.emit({
+      type: agentEventTypes[event.status],
+      taskId,
+      at: event.at,
+      payload: {
+        role,
+        stage: event.stage,
+        agentRunId,
+        ...this.safeStagePayload(event),
+      },
+    });
+  }
+
+  private safeStagePayload(event: PipelineStageEvent): Record<string, unknown> {
+    if (event.status === 'FAILED') return { error: event.error };
+    if (event.status === 'STARTED') return {};
+    if (event.stage === 'PLANNER') {
+      const result = event.result as PlannerResult;
+      return {
+        summary: result.summary,
+        affectedFiles: result.affectedFiles,
+        riskSignals: result.riskSignals,
+        verificationCommands: result.verification.commands,
+      };
+    }
+    if (event.stage === 'CODER') {
+      const result = event.result as { changedFiles: string[]; appliedEdits: { path: string }[] };
+      return {
+        changedFiles: result.changedFiles,
+        editPaths: result.appliedEdits.map((edit) => edit.path),
+      };
+    }
+    if (event.stage === 'REVIEWER') {
+      const result = event.result as ReviewerResult;
+      return { verdict: result.verdict, findings: result.findings };
+    }
+    if (event.stage === 'TESTER') {
+      const result = event.result as { tests: TestExecution[]; passed: boolean };
+      return {
+        passed: result.passed,
+        tests: result.tests.map((test) => ({
+          command: test.command,
+          status: test.status,
+          exitCode: test.exitCode,
+          durationMs: test.durationMs,
+        })),
+      };
+    }
+    return {};
+  }
+
+  private async transition(taskId: string, current: TaskStatus, target: TaskStatus) {
+    if (current === target) return current;
+    return this.lifecycle.transition(taskId, target);
+  }
+
+  private async failLifecycle(taskId: string, current: TaskStatus) {
+    if (current === 'TESTING') {
+      try {
+        return await this.transition(taskId, current, 'FAILED');
+      } catch {
+        return current;
+      }
+    }
+    if (
+      ['PLANNING', 'CONTEXT_READY', 'CODING', 'REVIEWING', 'REPAIRING', 'APPROVED'].includes(
+        current,
+      )
+    ) {
+      try {
+        return await this.transition(taskId, current, 'FAILED');
+      } catch {
+        return current;
+      }
+    }
+    return current;
+  }
+
+  private failed(
+    taskId: string,
+    stages: RuntimeExecutionStage[],
+    error: RuntimeExecutorError,
+    finalState?: TaskStatus,
+    workspace?: PersistedWorkspace,
+    changedFiles: string[] = [],
+    diff = '',
+    review?: ReviewerResult,
+    tests: TestExecution[] = [],
+  ): RuntimeExecutionResult {
+    return {
+      taskId,
+      status: finalState === 'BLOCKED' ? 'BLOCKED' : 'FAILED',
+      finalState,
+      workspace: workspace ? this.publicWorkspace(workspace) : undefined,
+      stages,
+      changedFiles,
+      diff,
+      review,
+      tests,
+      repairAttempts: finalState === 'BLOCKED' ? 1 : 0,
+      error: { code: error.code, message: error.message },
+    };
+  }
+
+  private publicWorkspace(workspace: PersistedWorkspace) {
+    return {
+      id: workspace.id,
+      rootPath: workspace.rootPath,
+      branch: workspace.branch,
+      baselineCommit: workspace.baselineCommit,
+    };
   }
 }
 export async function runMockWorkflow(taskId: string) {

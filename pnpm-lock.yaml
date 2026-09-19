@@ -211,9 +211,21 @@ importers:
 
   packages/runtime:
     dependencies:
+      '@codexflow/agents':
+        specifier: workspace:*
+        version: link:../agents
+      '@codexflow/database':
+        specifier: workspace:*
+        version: link:../database
+      '@codexflow/git':
+        specifier: workspace:*
+        version: link:../git
       '@codexflow/shared':
         specifier: workspace:*
         version: link:../shared
+      '@codexflow/workspace':
+        specifier: workspace:*
+        version: link:../workspace
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
