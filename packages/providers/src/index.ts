@@ -131,7 +131,7 @@ export class GitHubProvider implements GitProvider {
     base: string;
     title: string;
     body: string;
-  }) {
+  }): Promise<RemotePullRequest> {
     const value = z
       .object({
         owner: z.string().min(1),
