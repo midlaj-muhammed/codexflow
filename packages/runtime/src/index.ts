@@ -1,4 +1,6 @@
 import type { AgentRole, TaskStatus } from '@codexflow/shared';
+import { readFile, readdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import {
   CoreAgentPipeline,
   OpenAIResponsesProvider,
@@ -344,6 +346,9 @@ const agentEventTypes: Record<RuntimeExecutionStageStatus, RuntimeEventType> = {
   COMPLETED: 'agent.completed',
   FAILED: 'agent.failed',
 };
+const contextFileLimit = 12;
+const contextByteLimit = 24_000;
+const ignoredContextPath = /(^|\/)(\.git|node_modules|dist|build|coverage|\.next|\.env)(\/|$)|(^|\/)([^/]*secret[^/]*|[^/]*credential[^/]*|[^/]*\.pem|[^/]*\.key)$/i;
 
 export class RuntimeExecutor {
   private readonly store: CodexFlowStore;
@@ -613,17 +618,57 @@ export class RuntimeExecutor {
       runId: runId ?? `${task.id}:coder:${attempt}`,
       taskId: task.id,
       workspacePath: workspace.rootPath,
-      role: 'CODER',
-      prompt: [
-        `Task: ${task.prompt}`,
-        `Workspace branch: ${workspace.branch}`,
-        `Project languages: ${metadata.language.join(', ') || 'unknown'}`,
-        `Plan summary: ${plan.summary}`,
-        `Expected behavior: ${plan.expectedBehavior}`,
-        `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
-        'Return complete file contents for each changed file as structured edits.',
-      ].join('\n'),
+        role: 'CODER',
+        prompt: [
+          `Task: ${task.prompt}`,
+          `Workspace branch: ${workspace.branch}`,
+          `Project languages: ${metadata.language.join(', ') || 'unknown'}`,
+          `Plan summary: ${plan.summary}`,
+          `Expected behavior: ${plan.expectedBehavior}`,
+          `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
+          await this.buildWorkspaceContext(workspace.rootPath),
+          'Return complete file contents for each changed file as structured edits.',
+          'Only edit files required by the task. Do not modify tests or package metadata unless the task explicitly requires it.',
+        ].join('\n'),
     });
+  }
+
+  private async buildWorkspaceContext(workspacePath: string) {
+    const files = await this.listContextFiles(workspacePath);
+    let usedBytes = 0;
+    const sections: string[] = [];
+    for (const file of files) {
+      if (usedBytes >= contextByteLimit) break;
+      const content = await readFile(join(workspacePath, file), 'utf8').catch(() => undefined);
+      if (content === undefined) continue;
+      const remaining = contextByteLimit - usedBytes;
+      const snippet = content.slice(0, remaining);
+      usedBytes += Buffer.byteLength(snippet);
+      sections.push(`File: ${file}\n${snippet}`);
+    }
+    return sections.length
+      ? `Workspace context:\n${sections.join('\n\n')}`
+      : 'Workspace context: no safe text files selected.';
+  }
+
+  private async listContextFiles(root: string, dir = ''): Promise<string[]> {
+    const entries = await readdir(join(root, dir), { withFileTypes: true }).catch(() => []);
+    const files: string[] = [];
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      const relativePath = dir ? `${dir}/${entry.name}` : entry.name;
+      if (ignoredContextPath.test(relativePath)) continue;
+      if (entry.isDirectory()) {
+        files.push(...(await this.listContextFiles(root, relativePath)));
+      } else if (this.isContextFile(relativePath)) {
+        files.push(relativePath);
+      }
+      if (files.length >= contextFileLimit) break;
+    }
+    return files.slice(0, contextFileLimit);
+  }
+
+  private isContextFile(path: string) {
+    return /\.(ts|tsx|js|jsx|mjs|cjs|json|md|txt|css|html)$/i.test(path) && !ignoredContextPath.test(path);
   }
 
   private async handleStage(

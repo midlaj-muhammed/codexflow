@@ -23,6 +23,9 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Added Phase 13B `RuntimeExecutor` inside `packages/runtime`. It loads persisted tasks/projects/repositories, creates or reuses isolated workspaces through `WorkspaceManager`, invokes the existing `CoreAgentPipeline`, persists real stage outputs, forwards agent boundaries through the existing `EventBus`, and stops at the approval boundary.
 - Extended `CoreAgentPipeline` narrowly so RuntimeExecutor can resolve structured coder output after the real planner result exists and can observe the real Git diff before review.
 - Added public `agent_events` store operations over the existing table so safe stage metadata can be persisted with agent runs.
+- Added Phase 13C real OpenAI RuntimeExecutor E2E coverage. The test is explicitly gated by `CODEXFLOW_REAL_OPENAI_E2E=1` and uses the ignored local `OPENAI_API_KEY`.
+- Hardened `OpenAIResponsesProvider.runCoder()` to request strict schema-constrained JSON output from the Responses API and to parse the actual nested Responses output shape as well as the unit-test `output_text` fixture shape.
+- Added bounded safe workspace context to RuntimeExecutor prompts so the real provider receives the task, plan, verification command, and selected non-secret repository files.
 
 ## Architecture Compliance
 
@@ -32,6 +35,7 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Delivery remains the Phase 10 durable delivery service; the UI only reads its persisted records.
 - Runtime stage observability is callback-based inside the existing agent package so a future RuntimeExecutor can forward those truthful boundaries into the existing `EventBus` using `agent.started`, `agent.completed`, and `agent.failed`.
 - `RuntimeExecutor` now performs that forwarding for real pipeline execution. It does not call `runMockWorkflow`, does not use a mock provider fallback, does not approve tasks, and does not commit, push, or create PRs.
+- OpenAI credentials remain server-side only. Phase 13C tests assert the key, bearer headers, and authorization labels are absent from runtime events and persisted runtime records.
 
 ## Phase 13A Runtime Foundation
 
@@ -56,6 +60,22 @@ Add a developer-facing control plane without replacing the existing runtime, app
 - Repair: if the existing pipeline reports `REPAIRING` or `BLOCKED`, RuntimeExecutor truthfully transitions to `BLOCKED`. Provider-backed automated repair remains future work.
 - Approval boundary: successful execution stops at `READY_FOR_APPROVAL`; approval and delivery remain existing later boundaries.
 
+## Phase 13C Real OpenAI Execution
+
+- Test file: `packages/runtime/src/openai.e2e.test.ts`.
+- Command: `pnpm test:openai-e2e`.
+- Provider/model: `OpenAIResponsesProvider` using the existing default model `gpt-5`.
+- API key availability: `OPENAI_API_KEY configured: true` verified without printing the value.
+- Actual OpenAI requests: 1.
+- Fixture repository: temporary Git repository under `/tmp/codexflow-openai-e2e-*` with `src/math.js`, `tests/math.test.js`, `package.json`, and `README.md`.
+- Task: update only `src/math.js` so `add(a, b)` returns the sum of the two arguments.
+- Runtime path: `RuntimeExecutor.execute(taskId)` -> isolated worktree -> `CoreAgentPipeline` -> real OpenAI structured coder -> Coder -> Reviewer -> real Tester.
+- Result: PASS. Final lifecycle state was `READY_FOR_APPROVAL`.
+- Workspace isolation: source repository retained `return 0`; isolated task worktree contained the OpenAI-generated `return a + b` implementation.
+- Verification: actual test command `node tests/math.test.js` passed and was persisted as a `TestRun`.
+- Persistence: agent runs, plan, review, and test run were verified after execution.
+- Secret safety: runtime events and persisted execution records were checked for absence of the API key, `Bearer `, and `Authorization`.
+
 ## User Experience
 
 The dashboard supports importing a local repository, deterministic project scanning, creating a persisted task, selecting task detail, inspecting persisted status/agent/test/risk/approval/delivery/PR information, and approving/rejecting/cancelling only through backend endpoints. It clearly distinguishes unavailable runtime data from completed delivery.
@@ -70,27 +90,28 @@ The dashboard supports importing a local repository, deterministic project scann
 - `pnpm --filter @codexflow/database typecheck` — PASS.
 - `pnpm --filter @codexflow/database test` — PASS: 5 tests.
 - `pnpm --filter @codexflow/agents typecheck` — PASS.
-- `pnpm --filter @codexflow/agents test` — PASS: 17 tests, including stage boundary success/failure and repair callbacks.
+- `pnpm --filter @codexflow/agents test` — PASS: 18 tests, including stage boundary success/failure, repair callbacks, and schema-constrained OpenAI coder request coverage.
 - `pnpm --filter @codexflow/runtime typecheck` — PASS.
-- `pnpm --filter @codexflow/runtime test` — PASS: 11 tests, including RuntimeExecutor success, failure persistence, missing provider, invalid state, duplicate execution, and reusable agent boundary event names.
+- `pnpm --filter @codexflow/runtime test` — PASS: 12 passed, 1 skipped. Includes RuntimeExecutor success, failure persistence, missing provider, invalid state, duplicate execution, reusable agent boundary event names, and the gated OpenAI E2E file.
 - `pnpm --filter @codexflow/runtime lint` — PASS.
 - `pnpm --filter @codexflow/workspace test` — PASS: 2 tests.
 - `pnpm --filter @codexflow/git test` — PASS: 2 tests.
+- `pnpm test:openai-e2e` — PASS: real OpenAI E2E executed with 1 actual request.
 
 ## Regression Review
 
 - Phase 10 delivery tests — PASS.
 - Phase 11 provider tests — PASS through `pnpm test`.
 - Phase 12 real GitHub E2E — PASS.
-- No delivery, approval, GitHub, or Phase 10-12 recovery source changes were made for Phase 13B.
+- No delivery, approval, GitHub, or Phase 10-12 recovery source changes were made for Phase 13C.
 
 ## Remaining Blockers
 
 - HTTP start/cancel endpoints are still intentionally unimplemented after Phase 13B.
 - The browser is not yet connected to RuntimeExecutor, so a task created from the UI still cannot be started end-to-end from the browser.
-- Real OpenAI E2E through RuntimeExecutor has not yet been executed in this phase; Phase 13B uses an explicitly injected deterministic structured coder provider for repeatable runtime tests.
 - Provider-backed automated repair is not implemented; failed verification is persisted and surfaced as `BLOCKED`.
 - Durable cross-process runtime execution locking is not implemented; duplicate execution prevention is currently in-process.
+- Approval, commit, push, and GitHub PR delivery remain later Phase 13 steps and were not invoked by Phase 13C.
 
 ## Final Decision
 

@@ -136,6 +136,25 @@ export class AgentProviderError extends Error {
     super(message);
   }
 }
+type OpenAIResponseBody = {
+  id?: string;
+  output_text?: string;
+  output?: Array<{
+    type?: string;
+    content?: Array<{ type?: string; text?: string }>;
+  }>;
+};
+function extractOpenAIOutputText(body: OpenAIResponseBody) {
+  if (typeof body.output_text === 'string') return body.output_text;
+  for (const output of body.output ?? [])
+    for (const content of output.content ?? [])
+      if (
+        (content.type === 'output_text' || content.type === 'text') &&
+        typeof content.text === 'string'
+      )
+        return content.text;
+  return undefined;
+}
 export class OpenAIResponsesProvider implements AgentProvider, StructuredCoderProvider {
   private readonly events = new Map<string, AgentEvent[]>();
   constructor(
@@ -167,8 +186,9 @@ export class OpenAIResponsesProvider implements AgentProvider, StructuredCoderPr
         response.status === 401 ? 'AUTH_FAILED' : 'UNAVAILABLE',
         `OpenAI request failed (${response.status})`,
       );
-    const body = (await response.json()) as { id?: string; output_text?: string };
-    if (!body.id || typeof body.output_text !== 'string')
+    const body = (await response.json()) as OpenAIResponseBody;
+    const outputText = extractOpenAIOutputText(body);
+    if (!body.id || typeof outputText !== 'string')
       throw new AgentProviderError(
         'MALFORMED_RESPONSE',
         'OpenAI response did not contain output text',
@@ -180,7 +200,7 @@ export class OpenAIResponsesProvider implements AgentProvider, StructuredCoderPr
     };
     const events = [started, completed];
     this.events.set(input.runId, events);
-    return { runId: input.runId, output: body.output_text, events };
+    return { runId: input.runId, output: outputText, events };
   }
   async cancel(runId: string) {
     this.events.set(runId, [
@@ -188,13 +208,75 @@ export class OpenAIResponsesProvider implements AgentProvider, StructuredCoderPr
     ]);
   }
   async runCoder(input: AgentRunInput & { prompt: string }): Promise<CoderModelOutput> {
-    const result = await this.run({
-      ...input,
-      role: 'CODER',
-      prompt: `${input.prompt}\n\nReturn only JSON matching {"edits":[{"path":"relative/path","content":"full file content"}],"explanation":"optional"}. Never edit .env, .git, credentials, keys, or paths outside the workspace.`,
-    });
+    const prompt = `${input.prompt}\n\nReturn complete file contents for every edited file. Never edit .env, .git, credentials, keys, or paths outside the workspace.`;
+    const started: AgentEvent = {
+      type: 'progress',
+      message: 'CODER request started',
+      at: new Date().toISOString(),
+    };
+    this.events.set(input.runId, [started]);
+    let response: Response;
     try {
-      return coderModelOutputSchema.parse(JSON.parse(result.output));
+      response = await this.fetcher('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: this.model,
+          input: prompt,
+          store: false,
+          text: {
+            format: {
+              type: 'json_schema',
+              name: 'coder_model_output',
+              strict: true,
+              schema: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['edits', 'explanation'],
+                properties: {
+                  edits: {
+                    type: 'array',
+                    minItems: 1,
+                    items: {
+                      type: 'object',
+                      additionalProperties: false,
+                      required: ['path', 'content'],
+                      properties: {
+                        path: { type: 'string', minLength: 1 },
+                        content: { type: 'string' },
+                      },
+                    },
+                  },
+                  explanation: { type: 'string' },
+                },
+              },
+            },
+          },
+        }),
+      });
+    } catch {
+      throw new AgentProviderError('UNAVAILABLE', 'OpenAI Responses API is unavailable');
+    }
+    if (!response.ok)
+      throw new AgentProviderError(
+        response.status === 401 ? 'AUTH_FAILED' : 'UNAVAILABLE',
+        `OpenAI request failed (${response.status})`,
+      );
+    const body = (await response.json()) as OpenAIResponseBody;
+    const outputText = extractOpenAIOutputText(body);
+    if (!body.id || typeof outputText !== 'string')
+      throw new AgentProviderError(
+        'MALFORMED_RESPONSE',
+        'OpenAI response did not contain structured coder output',
+      );
+    try {
+      const completed: AgentEvent = {
+        type: 'completed',
+        message: 'CODER completed',
+        at: new Date().toISOString(),
+      };
+      this.events.set(input.runId, [started, completed]);
+      return coderModelOutputSchema.parse(JSON.parse(outputText));
     } catch {
       throw new AgentProviderError('MALFORMED_RESPONSE', 'OpenAI coder response was not valid structured edits');
     }

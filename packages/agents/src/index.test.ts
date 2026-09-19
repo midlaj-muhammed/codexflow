@@ -67,6 +67,50 @@ describe('scanner and mock provider', () => {
       }),
     ).resolves.toMatchObject({ output: 'structured result' });
   });
+  it('requests schema-constrained structured coder output from OpenAI', async () => {
+    const provider = new OpenAIResponsesProvider('top-secret', 'gpt-5', async (_url, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        text?: { format?: { type?: string; name?: string; strict?: boolean } };
+      };
+      expect(init?.headers).toMatchObject({ Authorization: 'Bearer top-secret' });
+      expect(body.text?.format).toMatchObject({
+        type: 'json_schema',
+        name: 'coder_model_output',
+        strict: true,
+      });
+      return new Response(
+        JSON.stringify({
+          id: 'resp_2',
+          output: [
+            {
+              type: 'message',
+              content: [
+                {
+                  type: 'output_text',
+                  text: JSON.stringify({
+                    edits: [{ path: 'src/message.txt', content: 'hello' }],
+                    explanation: 'fixture',
+                  }),
+                },
+              ],
+            },
+          ],
+        }),
+      );
+    });
+    await expect(
+      provider.runCoder({
+        runId: 'coder',
+        taskId: 't',
+        workspacePath: '/tmp',
+        role: 'CODER',
+        prompt: 'Change a file',
+      }),
+    ).resolves.toEqual({
+      edits: [{ path: 'src/message.txt', content: 'hello' }],
+      explanation: 'fixture',
+    });
+  });
   it('persists runner attempts and failures through a provider-neutral runner', async () => {
     const calls: string[] = [];
     const runner = new AgentRunner(new MockAgentProvider(), {
