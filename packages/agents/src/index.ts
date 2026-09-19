@@ -96,6 +96,14 @@ export type AgentRunInput = {
 };
 export type AgentEvent = { type: 'progress' | 'completed' | 'failed'; message: string; at: string };
 export type AgentRunResult = { runId: string; output: string; events: AgentEvent[] };
+export type CoderModelOutput = { edits: Array<{ path: string; content: string }>; explanation?: string };
+export const coderModelOutputSchema = z.object({
+  edits: z.array(z.object({ path: z.string().min(1), content: z.string() })).min(1),
+  explanation: z.string().optional(),
+});
+export interface StructuredCoderProvider {
+  runCoder(input: AgentRunInput & { prompt: string }): Promise<CoderModelOutput>;
+}
 export interface AgentProvider {
   run(input: AgentRunInput): Promise<AgentRunResult>;
   cancel(runId: string): Promise<void>;
@@ -128,7 +136,7 @@ export class AgentProviderError extends Error {
     super(message);
   }
 }
-export class OpenAIResponsesProvider implements AgentProvider {
+export class OpenAIResponsesProvider implements AgentProvider, StructuredCoderProvider {
   private readonly events = new Map<string, AgentEvent[]>();
   constructor(
     private readonly apiKey: string,
@@ -178,6 +186,18 @@ export class OpenAIResponsesProvider implements AgentProvider {
     this.events.set(runId, [
       { type: 'failed', message: 'Cancelled', at: new Date().toISOString() },
     ]);
+  }
+  async runCoder(input: AgentRunInput & { prompt: string }): Promise<CoderModelOutput> {
+    const result = await this.run({
+      ...input,
+      role: 'CODER',
+      prompt: `${input.prompt}\n\nReturn only JSON matching {"edits":[{"path":"relative/path","content":"full file content"}],"explanation":"optional"}. Never edit .env, .git, credentials, keys, or paths outside the workspace.`,
+    });
+    try {
+      return coderModelOutputSchema.parse(JSON.parse(result.output));
+    } catch {
+      throw new AgentProviderError('MALFORMED_RESPONSE', 'OpenAI coder response was not valid structured edits');
+    }
   }
   async *stream(runId: string) {
     for (const event of this.events.get(runId) ?? []) yield event;
