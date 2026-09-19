@@ -1,0 +1,12 @@
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.*
+node_modules/
+.git/
+dist/
+build/
+coverage/
+.next/
