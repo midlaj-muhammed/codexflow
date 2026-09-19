@@ -21,6 +21,10 @@ const migrations = [
    CREATE TABLE IF NOT EXISTS pull_requests (id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), provider_id TEXT NOT NULL, number INTEGER NOT NULL, url TEXT NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS pull_request_comments (id TEXT PRIMARY KEY, pull_request_id TEXT NOT NULL REFERENCES pull_requests(id), provider_id TEXT, body TEXT NOT NULL, author TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
    CREATE TABLE IF NOT EXISTS evaluations (id TEXT PRIMARY KEY, task_id TEXT REFERENCES tasks(id), benchmark_id TEXT NOT NULL, pass_at_1 INTEGER NOT NULL, pass_at_3 INTEGER NOT NULL, regression_detected INTEGER NOT NULL, repair_attempts INTEGER NOT NULL, duration_ms INTEGER NOT NULL, files_changed INTEGER NOT NULL, lines_added INTEGER NOT NULL, lines_removed INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);`,
+  `CREATE TABLE IF NOT EXISTS delivery_commits (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, sha TEXT NOT NULL, branch TEXT NOT NULL, message TEXT NOT NULL, baseline_sha TEXT NOT NULL, diff_fingerprint TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL);
+   CREATE UNIQUE INDEX IF NOT EXISTS delivery_commits_task_fingerprint ON delivery_commits(task_id, diff_fingerprint);
+   CREATE TABLE IF NOT EXISTS delivery_pushes (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, branch TEXT NOT NULL, remote TEXT NOT NULL, commit_sha TEXT NOT NULL, status TEXT NOT NULL, error TEXT, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);
+   CREATE TABLE IF NOT EXISTS delivery_pull_requests (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, provider TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL, base_branch TEXT NOT NULL, commit_sha TEXT NOT NULL, number INTEGER, url TEXT, title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, error TEXT, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);`,
 ];
 
 export function openDatabase(path = ':memory:'): Database {
@@ -134,5 +138,69 @@ export class CodexFlowStore {
         'SELECT ar.id, ar.role, ar.status, ar.attempt, ar.started_at AS startedAt, ar.finished_at AS finishedAt FROM agent_runs ar WHERE ar.task_id = ? ORDER BY ar.created_at',
       )
       .all(taskId);
+  }
+  createDeliveryCommit(input: {
+    taskId: string;
+    workspaceId: string;
+    sha: string;
+    branch: string;
+    message: string;
+    baselineSha: string;
+    diffFingerprint: string;
+    status?: string;
+  }) {
+    const id = randomUUID(),
+      createdAt = now();
+    this.db
+      .prepare('INSERT OR IGNORE INTO delivery_commits VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        id,
+        input.taskId,
+        input.workspaceId,
+        input.sha,
+        input.branch,
+        input.message,
+        input.baselineSha,
+        input.diffFingerprint,
+        input.status ?? 'COMMITTED',
+        createdAt,
+      );
+    return this.findDeliveryCommit(input.taskId, input.diffFingerprint)!;
+  }
+  findDeliveryCommit(taskId: string, diffFingerprint: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, sha, branch, message, baseline_sha AS baselineSha, diff_fingerprint AS diffFingerprint, status, created_at AS createdAt FROM delivery_commits WHERE task_id = ? AND diff_fingerprint = ?',
+      )
+      .get(taskId, diffFingerprint) as Record<string, unknown> | undefined;
+  }
+  createDeliveryPush(input: {
+    taskId: string;
+    workspaceId: string;
+    branch: string;
+    remote: string;
+    commitSha: string;
+    status: string;
+    error?: string;
+    attempt: number;
+  }) {
+    const id = randomUUID(),
+      createdAt = now();
+    this.db
+      .prepare('INSERT INTO delivery_pushes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(
+        id,
+        input.taskId,
+        input.workspaceId,
+        input.branch,
+        input.remote,
+        input.commitSha,
+        input.status,
+        input.error ?? null,
+        input.attempt,
+        createdAt,
+        input.status === 'SUCCEEDED' ? createdAt : null,
+      );
+    return id;
   }
 }

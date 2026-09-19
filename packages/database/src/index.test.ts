@@ -30,7 +30,7 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 1,
+      count: 2,
     });
   });
   it('validates repository input and prevents empty task prompts', () => {

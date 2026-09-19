@@ -5,6 +5,7 @@ import {
   type VerificationPlan,
 } from '@codexflow/agents';
 import { GitEngine } from '@codexflow/git';
+import type { CodexFlowStore } from '@codexflow/database';
 import type { GitProvider, RemotePullRequest } from '@codexflow/providers';
 export type CommitMetadata = { subject: string; body?: string };
 export type PullRequestMetadata = { title: string; body: string };
@@ -48,6 +49,7 @@ export class DeliveryService {
     private readonly provider: GitProvider,
     private readonly protectedBranches = ['main', 'master', 'production'],
     private readonly reporter = new Reporter(),
+    private readonly store?: CodexFlowStore,
   ) {}
   private assertSafe(record: DeliveryRecord) {
     if (this.protectedBranches.includes(record.branch))
@@ -72,14 +74,47 @@ export class DeliveryService {
     await this.git.stage(record.workspacePath, record.changedFiles);
     await this.git.commitStaged(record.workspacePath, message);
     const sha = (await this.git.revParse(record.workspacePath)).stdout;
-    return (record.commit = { sha, message });
+    record.commit = { sha, message };
+    this.store?.createDeliveryCommit({
+      taskId: record.taskId,
+      workspaceId: record.workspaceId,
+      sha,
+      branch: record.branch,
+      message,
+      baselineSha: record.baselineCommit,
+      diffFingerprint: this.approvals.fingerprint(record.diff),
+    });
+    return record.commit;
   }
   async push(record: DeliveryRecord) {
     if (!record.commit) throw new Error('Commit is required before push');
     if (record.pushed) return;
     this.assertSafe(record);
-    await this.git.push(record.workspacePath, 'origin', record.branch);
-    record.pushed = true;
+    try {
+      await this.git.push(record.workspacePath, 'origin', record.branch);
+      record.pushed = true;
+      this.store?.createDeliveryPush({
+        taskId: record.taskId,
+        workspaceId: record.workspaceId,
+        branch: record.branch,
+        remote: 'origin',
+        commitSha: record.commit.sha,
+        status: 'SUCCEEDED',
+        attempt: 1,
+      });
+    } catch (error) {
+      this.store?.createDeliveryPush({
+        taskId: record.taskId,
+        workspaceId: record.workspaceId,
+        branch: record.branch,
+        remote: 'origin',
+        commitSha: record.commit.sha,
+        status: 'FAILED',
+        error: error instanceof Error ? error.message : 'Push failed',
+        attempt: 1,
+      });
+      throw error;
+    }
   }
   async createPullRequest(record: DeliveryRecord, metadata = this.reporter.pr(record)) {
     if (record.pullRequest) return record.pullRequest;

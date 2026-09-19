@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@codexflow/agents": "workspace:*",
+    "@codexflow/database": "workspace:*",
     "@codexflow/git": "workspace:*",
     "@codexflow/providers": "workspace:*"
   },
