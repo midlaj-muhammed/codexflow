@@ -31,7 +31,7 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 5,
+      count: 6,
     });
   });
   it('persists fingerprint-bound approvals through the existing approvals table', () => {
@@ -188,5 +188,35 @@ describe('CodexFlowStore', () => {
     expect(store.getTaskExecutionLock(String(task.id))).toMatchObject({ ownerId: 'runtime-a' });
     store.releaseTaskExecutionLock(String(task.id), 'runtime-a');
     expect(store.acquireTaskExecutionLock(String(task.id), 'runtime-b', 1_000)).toBe(true);
+  });
+  it('persists versioned benchmarks, tasks, and reproducible evaluation results', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const benchmark = store.createBenchmark({ name: 'starter', description: 'controlled fixtures', version: '1.0.0' });
+    const task = store.createBenchmarkTask({
+      benchmarkId: benchmark.id,
+      name: 'add',
+      prompt: 'Implement add.',
+      verificationCommand: 'node tests/add.test.js',
+      expectedBehavior: '2 + 3 is 5',
+      metadata: { fixture: 'math-v1' },
+    });
+    const run = store.createEvaluationRun({
+      benchmarkTaskId: task.id,
+      repositoryCommit: 'base-sha',
+      provider: 'openai',
+      model: 'gpt-test',
+      finalState: 'READY_FOR_APPROVAL',
+      technicalSuccess: true,
+      reviewPassed: true,
+      verificationPassed: true,
+      repairAttempts: 0,
+      durationMs: 7,
+      filesChanged: 1,
+      linesAdded: 1,
+      linesRemoved: 1,
+    });
+    expect(store.listBenchmarks()).toContainEqual(expect.objectContaining({ id: benchmark.id, version: '1.0.0' }));
+    expect(store.getBenchmarkTask(task.id)).toMatchObject({ metadata: { fixture: 'math-v1' } });
+    expect(store.getEvaluationRun(run.id)).toMatchObject({ repositoryCommit: 'base-sha', technicalSuccess: true });
   });
 });

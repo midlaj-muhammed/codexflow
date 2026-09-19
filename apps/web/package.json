@@ -17,6 +17,7 @@
     "@codexflow/database": "workspace:*",
     "@codexflow/git": "workspace:*",
     "@codexflow/delivery": "workspace:*",
+    "@codexflow/evaluation": "workspace:*",
     "@codexflow/providers": "workspace:*",
     "@codexflow/runtime": "workspace:*",
     "@codexflow/shared": "workspace:*",

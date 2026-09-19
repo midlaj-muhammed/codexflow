@@ -1,6 +1,7 @@
 import { ApprovalService, TesterAgent, type ProjectMetadata, scanProject } from '@codexflow/agents';
 import { CodexFlowStore, openDatabase } from '@codexflow/database';
 import { DeliveryService } from '@codexflow/delivery';
+import { calculateEvaluationMetrics, ensureStarterBenchmark } from '@codexflow/evaluation';
 import { GitEngine } from '@codexflow/git';
 import { GitHubProvider } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
@@ -151,6 +152,7 @@ export function taskSnapshot(taskId: string) {
     plans: store.listPlans(taskId),
     reviews: store.listReviews(taskId),
     tests: store.listTestRuns(taskId),
+    evaluations: store.listEvaluationRunsForTask(taskId),
     approval,
     delivery: commit
       ? {
@@ -160,6 +162,16 @@ export function taskSnapshot(taskId: string) {
         }
       : { commit: undefined, pushes: [], pullRequests: [] },
   };
+}
+
+export function evaluationSnapshot() {
+  const { store } = controlPlane();
+  const starter = ensureStarterBenchmark(store);
+  const runs = store.listEvaluationRuns();
+  return { benchmarks: store.listBenchmarks().map((benchmark) => ({
+    ...benchmark,
+    taskCount: store.listBenchmarkTasks(benchmark.id).length,
+  })), starter, runs, metrics: calculateEvaluationMetrics(runs) };
 }
 
 export type ScanMetadata = ProjectMetadata;

@@ -13,9 +13,11 @@ type TaskDetail = {
   plans: Json[];
   reviews: Json[];
   tests: Json[];
+  evaluations: Json[];
   approval?: Json;
   delivery: { commit?: Json; pushes: Json[]; pullRequests: Json[] };
 };
+type EvaluationSummary = { benchmarks: Array<Json & { taskCount: number }>; runs: Json[]; metrics: Json };
 
 const statusClass = (value: unknown) => `status status-${String(value ?? 'UNKNOWN').toLowerCase()}`;
 const text = (value: unknown, fallback = 'Not available') =>
@@ -69,7 +71,7 @@ function Detail({ detail, onUpdate, onError }: { detail: TaskDetail; onUpdate: (
         <article className="panel"><h3>Review & changes</h3>{detail.reviews.length ? <ul>{((detail.reviews[0].findings as unknown[]) ?? []).map((finding) => <li key={JSON.stringify(finding)}>{JSON.stringify(finding)}</li>)}</ul> : <Empty>No persisted reviewer findings.</Empty>}{coderEvent ? <p className="subtle">Changed: {Array.isArray((coderEvent.payload as Json).changedFiles) ? ((coderEvent.payload as Json).changedFiles as unknown[]).join(', ') : 'recorded by runtime'}</p> : null}<p className="subtle">Proposed changes remain separate from committed delivery.</p></article>
         <article className="panel delivery"><h3>Delivery</h3>{delivery.commit ? <><p>Commit <code>{text(delivery.commit.sha)}</code></p><p>Branch <code>{text(delivery.commit.branch)}</code></p><ul className="runs">{delivery.pushes.map((push) => <li key={String(push.id)}><span className={statusClass(push.status)}>{String(push.status)}</span> Push attempt {String(push.attempt)}<small>{text(push.error, '')}</small></li>)}</ul></> : <Empty>Approval and final verification are required before delivery.</Empty>}</article>
         <article className="panel"><h3>Pull request</h3>{pr ? <><p><span className={statusClass(pr.status)}>PR #{String(pr.number)}</span></p><p>{text(pr.title)}</p><a className="button secondary" href={String(pr.url)} target="_blank" rel="noreferrer">Open GitHub PR ↗</a></> : <Empty>No persisted pull request.</Empty>}</article>
-        <article className="panel"><h3>Evaluation</h3><Empty>Technical evaluation is recorded separately from delivery success.</Empty></article>
+        <article className="panel"><h3>Evaluation</h3>{detail.evaluations.length ? <ul className="runs">{detail.evaluations.map((run) => <li key={String(run.id)}><span className={statusClass(run.technicalSuccess ? 'PASSED' : 'FAILED')}>{run.technicalSuccess ? 'TECHNICAL PASS' : 'TECHNICAL FAIL'}</span><small>{String(run.finalState)} · {String(run.durationMs)}ms · repairs {String(run.repairAttempts)}</small></li>)}</ul> : <Empty>Technical evaluation is recorded separately from delivery success.</Empty>}</article>
       </div>
     </section>
   );
@@ -79,6 +81,7 @@ export function ControlPlane() {
   const [repositories, setRepositories] = useState<Json[]>([]);
   const [projects, setProjects] = useState<Json[]>([]);
   const [tasks, setTasks] = useState<Json[]>([]);
+  const [evaluation, setEvaluation] = useState<EvaluationSummary>();
   const [detail, setDetail] = useState<TaskDetail>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -87,14 +90,16 @@ export function ControlPlane() {
   const refresh = useCallback(async () => {
     try {
       setError(undefined);
-      const [repoResult, projectResult, taskResult] = await Promise.all([
+      const [repoResult, projectResult, taskResult, evaluationResult] = await Promise.all([
         request<{ repositories: Json[] }>('/api/repositories'),
         request<{ projects: Json[] }>('/api/projects'),
         request<{ tasks: Json[] }>('/api/tasks'),
+        request<EvaluationSummary>('/api/evaluations'),
       ]);
       setRepositories(repoResult.repositories);
       setProjects(projectResult.projects);
       setTasks(taskResult.tasks);
+      setEvaluation(evaluationResult);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load control-plane data'); }
   }, []);
   useEffect(() => {
@@ -139,6 +144,7 @@ export function ControlPlane() {
     <section className="split" id="projects"><article className="card"><h2>Import a local repository</h2><p className="subtle">Imports scan actual files and Git status. Credentials stay server-side.</p><form onSubmit={importRepository} className="form"><input name="owner" placeholder="GitHub owner" required /><input name="name" placeholder="Repository name" required /><input name="url" type="url" placeholder="https://github.com/owner/repository" required /><input name="defaultBranch" defaultValue="main" required /><input name="localPath" placeholder="Absolute local clone path" required /><button className="button" disabled={busy}>Import & scan</button></form></article><article className="card"><h2>Create task</h2><p className="subtle">Describe the work. The runtime owns agents, Git, risk, approval, and delivery.</p>{projects.length ? <form onSubmit={createTask} className="form"><select name="projectId" value={selectedProject || String(projects[0]?.id ?? '')} onChange={(event) => setSelectedProject(event.target.value)}>{projects.map((project) => <option key={String(project.id)} value={String(project.id)}>{String(project.name)}</option>)}</select><textarea name="description" placeholder="Describe the coding task" minLength={3} required /><button className="button" disabled={busy}>Create task</button></form> : <Empty>Import a local repository before creating a task.</Empty>}</article></section>
     <section className="card" id="projects"><h2>Projects & repository status</h2>{repositories.length ? <div className="table">{repositories.map((repo) => <div className="row" key={String(repo.id)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.defaultBranch)} · {String((repo.git as Json | undefined)?.status ?? 'UNKNOWN')}</small></div><div>{projects.filter((project) => project.repositoryId === repo.id).map((project) => <span className="tag" key={String(project.id)}>{String(project.name)}</span>)}</div></div>)}</div> : <Empty>No repository has been imported.</Empty>}</section>
     <section className="card" id="tasks"><h2>Tasks</h2>{tasks.length ? <div className="table">{tasks.map((task) => <button className="row task-row" onClick={() => void openTask(String(task.id))} key={String(task.id)}><div><strong>{String(task.prompt)}</strong><small>{String(task.createdAt)}</small></div><span className={statusClass(task.deliveryStatus ?? task.status)}>{String(task.deliveryStatus ?? task.status)}</span></button>)}</div> : <Empty>No tasks yet. Create one to start a persisted lifecycle.</Empty>}</section>
+    <section className="card" id="evaluation"><h2>Evaluation benchmarks</h2>{evaluation ? <><p className="subtle">{evaluation.benchmarks.reduce((count, benchmark) => count + Number(benchmark.taskCount), 0)} controlled tasks · {evaluation.runs.length} persisted runs</p><div className="metrics"><div><strong>{String(evaluation.metrics.finalTaskSuccessRate ?? '—')}</strong><span>technical success</span></div><div><strong>{String(evaluation.metrics.repairRate ?? '—')}</strong><span>repair rate</span></div><div><strong>{String(evaluation.metrics.blockedRate ?? '—')}</strong><span>blocked rate</span></div></div><ul className="runs">{evaluation.benchmarks.map((benchmark) => <li key={String(benchmark.id)}><strong>{String(benchmark.name)}</strong><small>v{String(benchmark.version)} · {String(benchmark.taskCount)} tasks</small></li>)}</ul></> : <Empty>Loading persisted benchmark records.</Empty>}</section>
   <div id="delivery">{detail ? <Detail detail={detail} onUpdate={(task) => { setDetail(task); void refresh(); }} onError={setError} /> : <section className="card"><h2>Agent run</h2><Empty>Select a task to inspect its plan, agents, verification, risk, approval, delivery, and evaluation records.</Empty></section>}</div>
   </main>;
 }

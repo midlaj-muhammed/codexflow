@@ -50,6 +50,52 @@ const migrations = [
     expires_at TEXT NOT NULL
   );
    CREATE INDEX IF NOT EXISTS task_execution_locks_expires ON task_execution_locks(expires_at);`,
+  `CREATE TABLE IF NOT EXISTS benchmarks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(name, version)
+  );
+   CREATE TABLE IF NOT EXISTS benchmark_tasks (
+    id TEXT PRIMARY KEY,
+    benchmark_id TEXT NOT NULL REFERENCES benchmarks(id),
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    setup_command TEXT,
+    verification_command TEXT NOT NULL,
+    expected_behavior TEXT NOT NULL,
+    timeout_ms INTEGER,
+    metadata TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(benchmark_id, name)
+  );
+   CREATE TABLE IF NOT EXISTS evaluation_runs (
+    id TEXT PRIMARY KEY,
+    benchmark_task_id TEXT NOT NULL REFERENCES benchmark_tasks(id),
+    task_id TEXT REFERENCES tasks(id),
+    repository_commit TEXT,
+    provider TEXT,
+    model TEXT,
+    final_state TEXT NOT NULL,
+    technical_success INTEGER NOT NULL,
+    review_passed INTEGER,
+    verification_passed INTEGER,
+    repair_attempts INTEGER NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    files_changed INTEGER NOT NULL,
+    lines_added INTEGER NOT NULL,
+    lines_removed INTEGER NOT NULL,
+    token_usage INTEGER,
+    cost_usd REAL,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+   CREATE INDEX IF NOT EXISTS evaluation_runs_benchmark_task ON evaluation_runs(benchmark_task_id, created_at);`,
 ];
 
 export type DeliveryStatus =
@@ -104,6 +150,49 @@ export type ReviewRecord = {
   findings: ReviewFindingRecord[];
   createdAt: string;
   updatedAt?: string;
+};
+export type BenchmarkRecord = {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  createdAt: string;
+  updatedAt: string;
+};
+export type BenchmarkTaskRecord = {
+  id: string;
+  benchmarkId: string;
+  name: string;
+  prompt: string;
+  setupCommand?: string;
+  verificationCommand: string;
+  expectedBehavior: string;
+  timeoutMs?: number;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+  updatedAt: string;
+};
+export type EvaluationRunRecord = {
+  id: string;
+  benchmarkTaskId: string;
+  taskId?: string;
+  repositoryCommit?: string;
+  provider?: string;
+  model?: string;
+  finalState: string;
+  technicalSuccess: boolean;
+  reviewPassed?: boolean;
+  verificationPassed?: boolean;
+  repairAttempts: number;
+  durationMs: number;
+  filesChanged: number;
+  linesAdded: number;
+  linesRemoved: number;
+  tokenUsage?: number;
+  costUsd?: number;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
 };
 
 const optionalString = (value: unknown) => (value == null ? undefined : String(value));
@@ -840,5 +929,97 @@ export class CodexFlowStore {
         "SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pull_requests WHERE task_id = ? AND branch = ? AND commit_sha = ? AND status = 'SUCCEEDED' ORDER BY completed_at DESC LIMIT 1",
       )
       .get(taskId, branch, commitSha) as Record<string, unknown> | undefined;
+  }
+  createBenchmark(input: { name: string; description: string; version: string }) {
+    if (!input.name.trim() || !input.description.trim() || !input.version.trim()) {
+      throw new Error('Benchmark name, description, and version are required');
+    }
+    const id = randomUUID();
+    const timestamp = now();
+    this.db
+      .prepare('INSERT INTO benchmarks (id, name, description, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, input.name.trim(), input.description.trim(), input.version.trim(), timestamp, timestamp);
+    return this.getBenchmark(id)!;
+  }
+  getBenchmark(id: string): BenchmarkRecord | undefined {
+    const row = this.db.prepare(
+      'SELECT id, name, description, version, created_at AS createdAt, updated_at AS updatedAt FROM benchmarks WHERE id = ?',
+    ).get(id) as Record<string, unknown> | undefined;
+    return row as BenchmarkRecord | undefined;
+  }
+  listBenchmarks(): BenchmarkRecord[] {
+    return this.db.prepare(
+      'SELECT id, name, description, version, created_at AS createdAt, updated_at AS updatedAt FROM benchmarks ORDER BY created_at DESC',
+    ).all() as BenchmarkRecord[];
+  }
+  createBenchmarkTask(input: {
+    benchmarkId: string;
+    name: string;
+    prompt: string;
+    setupCommand?: string;
+    verificationCommand: string;
+    expectedBehavior: string;
+    timeoutMs?: number;
+    metadata?: Record<string, unknown>;
+  }) {
+    if (!this.getBenchmark(input.benchmarkId)) throw new Error(`Benchmark not found: ${input.benchmarkId}`);
+    if (!input.name.trim() || !input.prompt.trim() || !input.verificationCommand.trim() || !input.expectedBehavior.trim()) {
+      throw new Error('Benchmark task name, prompt, verification command, and expected behavior are required');
+    }
+    const id = randomUUID();
+    const timestamp = now();
+    this.db.prepare(
+      'INSERT INTO benchmark_tasks (id, benchmark_id, name, prompt, setup_command, verification_command, expected_behavior, timeout_ms, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(id, input.benchmarkId, input.name.trim(), input.prompt.trim(), input.setupCommand ?? null,
+      input.verificationCommand.trim(), input.expectedBehavior.trim(), input.timeoutMs ?? null,
+      JSON.stringify(input.metadata ?? {}), timestamp, timestamp);
+    return this.getBenchmarkTask(id)!;
+  }
+  getBenchmarkTask(id: string): BenchmarkTaskRecord | undefined {
+    const row = this.db.prepare(
+      'SELECT id, benchmark_id AS benchmarkId, name, prompt, setup_command AS setupCommand, verification_command AS verificationCommand, expected_behavior AS expectedBehavior, timeout_ms AS timeoutMs, metadata, created_at AS createdAt, updated_at AS updatedAt FROM benchmark_tasks WHERE id = ?',
+    ).get(id) as Record<string, unknown> | undefined;
+    return row ? { ...row, setupCommand: optionalString(row.setupCommand), timeoutMs: row.timeoutMs == null ? undefined : Number(row.timeoutMs), metadata: JSON.parse(String(row.metadata ?? '{}')) } as BenchmarkTaskRecord : undefined;
+  }
+  listBenchmarkTasks(benchmarkId: string): BenchmarkTaskRecord[] {
+    return (this.db.prepare(
+      'SELECT id, benchmark_id AS benchmarkId, name, prompt, setup_command AS setupCommand, verification_command AS verificationCommand, expected_behavior AS expectedBehavior, timeout_ms AS timeoutMs, metadata, created_at AS createdAt, updated_at AS updatedAt FROM benchmark_tasks WHERE benchmark_id = ? ORDER BY created_at ASC',
+    ).all(benchmarkId) as Record<string, unknown>[]).map((row) => ({ ...row, setupCommand: optionalString(row.setupCommand), timeoutMs: row.timeoutMs == null ? undefined : Number(row.timeoutMs), metadata: JSON.parse(String(row.metadata ?? '{}')) }) as BenchmarkTaskRecord);
+  }
+  createEvaluationRun(input: Omit<EvaluationRunRecord, 'id' | 'createdAt' | 'updatedAt'>): EvaluationRunRecord {
+    if (!this.getBenchmarkTask(input.benchmarkTaskId)) throw new Error(`Benchmark task not found: ${input.benchmarkTaskId}`);
+    const id = randomUUID();
+    const timestamp = now();
+    this.db.prepare(
+      'INSERT INTO evaluation_runs (id, benchmark_task_id, task_id, repository_commit, provider, model, final_state, technical_success, review_passed, verification_passed, repair_attempts, duration_ms, files_changed, lines_added, lines_removed, token_usage, cost_usd, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(id, input.benchmarkTaskId, input.taskId ?? null, input.repositoryCommit ?? null, input.provider ?? null,
+      input.model ?? null, input.finalState, Number(input.technicalSuccess), input.reviewPassed == null ? null : Number(input.reviewPassed),
+      input.verificationPassed == null ? null : Number(input.verificationPassed), input.repairAttempts, input.durationMs,
+      input.filesChanged, input.linesAdded, input.linesRemoved, input.tokenUsage ?? null, input.costUsd ?? null,
+      input.error ?? null, timestamp, timestamp);
+    return this.getEvaluationRun(id)!;
+  }
+  getEvaluationRun(id: string): EvaluationRunRecord | undefined {
+    const row = this.db.prepare(
+      'SELECT id, benchmark_task_id AS benchmarkTaskId, task_id AS taskId, repository_commit AS repositoryCommit, provider, model, final_state AS finalState, technical_success AS technicalSuccess, review_passed AS reviewPassed, verification_passed AS verificationPassed, repair_attempts AS repairAttempts, duration_ms AS durationMs, files_changed AS filesChanged, lines_added AS linesAdded, lines_removed AS linesRemoved, token_usage AS tokenUsage, cost_usd AS costUsd, error, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_runs WHERE id = ?',
+    ).get(id) as Record<string, unknown> | undefined;
+    if (!row) return undefined;
+    return {
+      ...row,
+      taskId: optionalString(row.taskId), repositoryCommit: optionalString(row.repositoryCommit), provider: optionalString(row.provider), model: optionalString(row.model), error: optionalString(row.error),
+      technicalSuccess: Boolean(row.technicalSuccess), reviewPassed: row.reviewPassed == null ? undefined : Boolean(row.reviewPassed), verificationPassed: row.verificationPassed == null ? undefined : Boolean(row.verificationPassed),
+      repairAttempts: Number(row.repairAttempts), durationMs: Number(row.durationMs), filesChanged: Number(row.filesChanged), linesAdded: Number(row.linesAdded), linesRemoved: Number(row.linesRemoved), tokenUsage: row.tokenUsage == null ? undefined : Number(row.tokenUsage), costUsd: row.costUsd == null ? undefined : Number(row.costUsd),
+    } as EvaluationRunRecord;
+  }
+  listEvaluationRuns(benchmarkTaskId?: string): EvaluationRunRecord[] {
+    const statement = benchmarkTaskId
+      ? this.db.prepare('SELECT id FROM evaluation_runs WHERE benchmark_task_id = ? ORDER BY created_at DESC')
+      : this.db.prepare('SELECT id FROM evaluation_runs ORDER BY created_at DESC');
+    const rows = (benchmarkTaskId ? statement.all(benchmarkTaskId) : statement.all()) as { id: string }[];
+    return rows.map((row) => this.getEvaluationRun(row.id)!);
+  }
+  listEvaluationRunsForTask(taskId: string): EvaluationRunRecord[] {
+    const rows = this.db.prepare('SELECT id FROM evaluation_runs WHERE task_id = ? ORDER BY created_at DESC').all(taskId) as { id: string }[];
+    return rows.map((row) => this.getEvaluationRun(row.id)!);
   }
 }

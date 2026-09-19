@@ -41,6 +41,9 @@ importers:
       '@codexflow/delivery':
         specifier: workspace:*
         version: link:../../packages/delivery
+      '@codexflow/evaluation':
+        specifier: workspace:*
+        version: link:../../packages/evaluation
       '@codexflow/git':
         specifier: workspace:*
         version: link:../../packages/git
@@ -161,6 +164,40 @@ importers:
       '@codexflow/runtime':
         specifier: workspace:*
         version: link:../runtime
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.13.5
+      eslint:
+        specifier: ^9.0.0
+        version: 9.39.5(jiti@2.7.0)(supports-color@7.2.0)
+      typescript:
+        specifier: 5.8.3
+        version: 5.8.3
+      typescript-eslint:
+        specifier: ^8.0.0
+        version: 8.70.0(eslint@9.39.5(jiti@2.7.0)(supports-color@7.2.0))(supports-color@7.2.0)(typescript@5.8.3)
+      vitest:
+        specifier: ^4.0.0
+        version: 4.1.11(@types/node@24.13.5)(vite@8.3.0(@types/node@24.13.5)(jiti@2.7.0))
+
+  packages/evaluation:
+    dependencies:
+      '@codexflow/agents':
+        specifier: workspace:*
+        version: link:../agents
+      '@codexflow/database':
+        specifier: workspace:*
+        version: link:../database
+      '@codexflow/git':
+        specifier: workspace:*
+        version: link:../git
+      '@codexflow/runtime':
+        specifier: workspace:*
+        version: link:../runtime
+      '@codexflow/workspace':
+        specifier: workspace:*
+        version: link:../workspace
     devDependencies:
       '@types/node':
         specifier: ^24.0.0
