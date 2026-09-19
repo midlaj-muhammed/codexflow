@@ -10,7 +10,8 @@
     "@codexflow/agents": "workspace:*",
     "@codexflow/database": "workspace:*",
     "@codexflow/git": "workspace:*",
-    "@codexflow/providers": "workspace:*"
+    "@codexflow/providers": "workspace:*",
+    "@codexflow/runtime": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

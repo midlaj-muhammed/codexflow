@@ -4,9 +4,10 @@ import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabase, CodexFlowStore } from '@codexflow/database';
-import { ApprovalService, TesterAgent } from '@codexflow/agents';
+import { ApprovalService, CoreAgentPipeline, RiskEngine, TesterAgent } from '@codexflow/agents';
 import { GitEngine } from '@codexflow/git';
 import type { GitProvider, RemotePullRequest } from '@codexflow/providers';
+import { EventBus, TaskLifecycleManager } from '@codexflow/runtime';
 import { DeliveryService, type DeliveryRecord } from './index.js';
 
 function git(cwd: string, ...args: string[]) {
@@ -135,6 +136,41 @@ function service(input: {
 }
 
 describe('DeliveryService durable delivery', () => {
+  it('continues a real planner, coder, reviewer, tester, risk, approval, and delivery flow', async () => {
+    const { path, baseline } = fixture(true);
+    const { db, store, task } = createStore();
+    const workspace = workspaceStore(store, String(task.id), path, baseline);
+    const pipeline = await new CoreAgentPipeline().run({
+      prompt: 'Improve the fixture text',
+      metadata: {
+        language: ['TypeScript'],
+        testCommand: 'test -f a.txt',
+        sourceDirectories: [],
+        testDirectories: [],
+        configFiles: [],
+      },
+      workspacePath: path,
+      modelOutput: JSON.stringify({ edits: [{ path: 'a.txt', content: 'newer' }] }),
+      diff: 'fixture edit',
+      changedFiles: ['a.txt'],
+    });
+    expect(pipeline.next).toBe('READY_FOR_APPROVAL');
+    const diff = (await new GitEngine().diff(path)).stdout;
+    const risk = new RiskEngine().assess({ changedFiles: pipeline.code.changedFiles, additions: 1, deletions: 1 });
+    const delivery = record({ taskId: String(task.id), workspaceId: workspace.id, path, baseline, diff });
+    delivery.changedFiles = pipeline.code.changedFiles;
+    delivery.verification = pipeline.plan.verification;
+    delivery.risk = risk;
+    const approvals = new ApprovalService();
+    approvals.request(delivery.taskId, delivery.workspaceId, diff, risk);
+    approvals.approve(delivery.taskId, 'human', diff);
+    const pullRequest = await service({ approvals, store }).deliver(delivery);
+
+    expect(pullRequest.number).toBe(42);
+    expect(store.getTask(delivery.taskId)?.deliveryStatus).toBe('PR_CREATED');
+    db.close();
+  });
+
   it('runs final verification, commits explicit files, persists, and is restart-idempotent', async () => {
     const { path, baseline } = fixture();
     const sqlite = join(mkdtempSync(join(tmpdir(), 'delivery-db-')), 'codexflow.sqlite');
@@ -358,5 +394,88 @@ describe('DeliveryService durable delivery', () => {
     await expect(service({ approvals }).commit(protectedRecord)).rejects.toThrow(
       'Protected branch delivery is forbidden',
     );
+  });
+
+  it('does not create a duplicate PR when provider discovery reports another commit on the branch', async () => {
+    const { path, baseline } = fixture(true);
+    const { db, store, task } = createStore();
+    const workspace = workspaceStore(store, String(task.id), path, baseline);
+    const delivery = record({ taskId: String(task.id), workspaceId: workspace.id, path, baseline });
+    const fake = provider({
+      existing: {
+        id: 'existing',
+        number: 8,
+        url: 'https://github.com/a/b/pull/8',
+        title: 'Existing branch PR',
+        body: 'Existing branch PR',
+        status: 'OPEN',
+        headSha: 'different-commit',
+      },
+    });
+    const deliveryService = service({
+      approvals: approvalsFor(delivery.taskId, delivery.workspaceId, delivery.diff),
+      provider: fake,
+      store,
+    });
+    await deliveryService.commit(delivery);
+    await deliveryService.push(delivery);
+    await expect(deliveryService.createPullRequest(delivery)).rejects.toThrow(
+      'Existing pull request does not reference the committed delivery SHA',
+    );
+    expect(fake.creates).toBe(0);
+    db.close();
+  });
+
+  it('orchestrates delivery through runtime events and uses actual verification records in PR metadata', async () => {
+    const { path, baseline } = fixture(true);
+    const { db, store, task } = createStore();
+    const workspace = workspaceStore(store, String(task.id), path, baseline);
+    const delivery = record({ taskId: String(task.id), workspaceId: workspace.id, path, baseline });
+    const observed: string[] = [];
+    const lifecycle = new TaskLifecycleManager({
+      saveTaskState: () => {},
+      saveDeliveryState: (taskId, status, error) => {
+        store.setTaskDeliveryStatus(taskId, status, error);
+      },
+      appendEvent: () => {},
+    });
+    const events = new EventBus({
+      saveTaskState: () => {},
+      appendEvent: (event) => {
+        observed.push(event.type);
+      },
+    });
+    events.subscribe((event) => {
+      observed.push(event.type);
+    });
+    const pullRequest = await new DeliveryService(
+      new GitEngine(),
+      approvalsFor(delivery.taskId, delivery.workspaceId, delivery.diff),
+      new TesterAgent(),
+      provider(),
+      ['main', 'master', 'production'],
+      undefined,
+      store,
+      { lifecycle, events },
+    ).deliver(delivery);
+
+    expect(pullRequest.number).toBe(42);
+    expect(store.listTestRuns(delivery.taskId)).toEqual([
+      expect.objectContaining({ command: 'test -f a.txt', status: 'PASSED' }),
+    ]);
+    expect(store.findSuccessfulDeliveryPullRequest(delivery.taskId, delivery.branch, delivery.commit!.sha)?.body).toContain(
+      'test -f a.txt: PASSED',
+    );
+    expect(store.getTask(delivery.taskId)?.deliveryStatus).toBe('PR_CREATED');
+    expect(observed).toEqual(
+      expect.arrayContaining([
+        'delivery.started',
+        'commit.completed',
+        'push.completed',
+        'pr.completed',
+        'delivery.completed',
+      ]),
+    );
+    db.close();
   });
 });

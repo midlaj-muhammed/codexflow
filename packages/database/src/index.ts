@@ -162,6 +162,43 @@ export class CodexFlowStore {
       )
       .all(taskId);
   }
+  recordTestRun(input: {
+    taskId: string;
+    command: string;
+    status: 'PASSED' | 'FAILED';
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+    durationMs: number;
+  }) {
+    const id = randomUUID(),
+      timestamp = now();
+    this.db
+      .prepare(
+        'INSERT INTO test_runs (id, task_id, test_plan_id, command, status, exit_code, stdout, stderr, duration_ms, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        id,
+        input.taskId,
+        null,
+        input.command,
+        input.status,
+        input.exitCode,
+        input.stdout,
+        input.stderr,
+        input.durationMs,
+        timestamp,
+        timestamp,
+      );
+    return id;
+  }
+  listTestRuns(taskId: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, command, status, exit_code AS exitCode, stdout, stderr, duration_ms AS durationMs, created_at AS createdAt FROM test_runs WHERE task_id = ? ORDER BY created_at ASC',
+      )
+      .all(taskId) as Record<string, unknown>[];
+  }
   createDeliveryCommit(input: {
     taskId: string;
     workspaceId: string;

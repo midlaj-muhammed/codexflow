@@ -18,6 +18,8 @@ export type RemotePullRequest = {
   title: string;
   body: string;
   status: 'OPEN' | 'CLOSED' | 'MERGED';
+  /** The provider's current source commit when it exposes one. */
+  headSha?: string;
 };
 export interface GitProvider {
   authenticate(token: string): Promise<{ login: string }>;
@@ -38,6 +40,11 @@ export interface GitProvider {
     head: string;
     base: string;
   }): Promise<RemotePullRequest | undefined>;
+  getPullRequest?(input: {
+    owner: string;
+    name: string;
+    number: number;
+  }): Promise<RemotePullRequest>;
 }
 export class ProviderError extends Error {
   constructor(
@@ -55,6 +62,16 @@ const repoSchema = z.object({
   clone_url: z.url(),
   default_branch: z.string(),
   private: z.boolean(),
+});
+const pullRequestSchema = z.object({
+  id: z.number(),
+  number: z.number(),
+  html_url: z.url(),
+  title: z.string(),
+  body: z.string().nullable(),
+  state: z.enum(['open', 'closed']),
+  merged: z.boolean().optional(),
+  head: z.object({ sha: z.string().min(1) }).optional(),
 });
 export class GitHubProvider implements GitProvider {
   constructor(
@@ -104,6 +121,18 @@ export class GitHubProvider implements GitProvider {
       private: value.private,
     };
   }
+  private mapPullRequest(raw: unknown): RemotePullRequest {
+    const result = pullRequestSchema.parse(raw);
+    return {
+      id: String(result.id),
+      number: result.number,
+      url: result.html_url,
+      title: result.title,
+      body: result.body ?? '',
+      status: result.merged ? 'MERGED' : result.state === 'open' ? 'OPEN' : 'CLOSED',
+      headSha: result.head?.sha,
+    };
+  }
   async authenticate(token: string) {
     if (!token.trim()) throw new ProviderError('AUTH_FAILED', 'GitHub token is required');
     const profile = await this.request('/user');
@@ -148,18 +177,10 @@ export class GitHubProvider implements GitProvider {
         body: z.string(),
       })
       .parse(input);
-    const result = z
-      .object({
-        id: z.number(),
-        number: z.number(),
-        html_url: z.url(),
-        title: z.string(),
-        body: z.string().nullable(),
-        state: z.enum(['open', 'closed']),
-        merged: z.boolean().optional(),
-      })
-      .parse(
-        await this.request(`/repos/${value.owner}/${value.name}/pulls`, {
+    return this.mapPullRequest(
+      await this.request(
+        `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/pulls`,
+        {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -168,16 +189,9 @@ export class GitHubProvider implements GitProvider {
             title: value.title,
             body: value.body,
           }),
-        }),
-      );
-    return {
-      id: String(result.id),
-      number: result.number,
-      url: result.html_url,
-      title: result.title,
-      body: result.body ?? '',
-      status: result.merged ? 'MERGED' : result.state === 'open' ? 'OPEN' : 'CLOSED',
-    };
+        },
+      ),
+    );
   }
   async findPullRequest(input: { owner: string; name: string; head: string; base: string }) {
     const value = z
@@ -189,33 +203,26 @@ export class GitHubProvider implements GitProvider {
       })
       .parse(input);
     const pulls = z
-      .array(
-        z.object({
-          id: z.number(),
-          number: z.number(),
-          html_url: z.url(),
-          title: z.string(),
-          body: z.string().nullable(),
-          state: z.enum(['open', 'closed']),
-          merged: z.boolean().optional(),
-        }),
-      )
+      .array(pullRequestSchema)
       .parse(
         await this.request(
-          `/repos/${value.owner}/${value.name}/pulls?state=all&head=${encodeURIComponent(
+          `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/pulls?state=all&head=${encodeURIComponent(
             `${value.owner}:${value.head}`,
           )}&base=${encodeURIComponent(value.base)}`,
         ),
       );
     const pull = pulls[0];
     if (!pull) return undefined;
-    return {
-      id: String(pull.id),
-      number: pull.number,
-      url: pull.html_url,
-      title: pull.title,
-      body: pull.body ?? '',
-      status: pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED',
-    } satisfies RemotePullRequest;
+    return this.mapPullRequest(pull);
+  }
+  async getPullRequest(input: { owner: string; name: string; number: number }) {
+    const value = z
+      .object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive() })
+      .parse(input);
+    return this.mapPullRequest(
+      await this.request(
+        `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/pulls/${value.number}`,
+      ),
+    );
   }
 }

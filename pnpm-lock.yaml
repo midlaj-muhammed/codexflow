@@ -137,6 +137,9 @@ importers:
       '@codexflow/providers':
         specifier: workspace:*
         version: link:../providers
+      '@codexflow/runtime':
+        specifier: workspace:*
+        version: link:../runtime
     devDependencies:
       '@types/node':
         specifier: ^24.0.0

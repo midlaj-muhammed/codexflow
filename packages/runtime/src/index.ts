@@ -31,6 +31,19 @@ export type RuntimeEventType =
   | 'commit.created'
   | 'branch.pushed'
   | 'pull_request.created'
+  | 'delivery.started'
+  | 'commit.started'
+  | 'commit.completed'
+  | 'commit.failed'
+  | 'push.started'
+  | 'push.completed'
+  | 'push.failed'
+  | 'pr.started'
+  | 'pr.completed'
+  | 'pr.failed'
+  | 'delivery.reconciled'
+  | 'delivery.completed'
+  | 'delivery.blocked'
   | 'evaluation.completed';
 export type RuntimeEvent = {
   type: RuntimeEventType;
