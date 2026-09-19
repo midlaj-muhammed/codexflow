@@ -44,9 +44,10 @@ function Detail({ detail, onUpdate, onError }: { detail: TaskDetail; onUpdate: (
     : [];
   const pr = delivery.pullRequests.find((entry) => entry.status === 'SUCCEEDED');
   const coderEvent = detail.agentEvents.find((event) => event.type === 'agent.completed' && (event.payload as Json | undefined)?.stage === 'CODER');
-  async function action(name: 'approve' | 'reject' | 'cancel' | 'execute') {
+  async function action(name: 'approve' | 'reject' | 'cancel' | 'execute' | 'refresh-pr') {
     try {
-      const result = await request<{ task: TaskDetail }>(`/api/tasks/${String(task.id)}/${name}`, { method: 'POST' });
+      const suffix = name === 'refresh-pr' ? 'pull-request/refresh' : name;
+      const result = await request<{ task: TaskDetail }>(`/api/tasks/${String(task.id)}/${suffix}`, { method: 'POST' });
       if (result.task) onUpdate(result.task);
     } catch (cause) {
       onError(cause instanceof Error ? cause.message : 'Task action failed');
@@ -70,7 +71,7 @@ function Detail({ detail, onUpdate, onError }: { detail: TaskDetail; onUpdate: (
         <article className="panel"><h3>Agent timeline</h3>{detail.agents.length ? <ol className="timeline">{detail.agents.map((agent) => <li key={String(agent.id)}><strong>{String(agent.role)}</strong><span>{String(agent.status)} · attempt {String(agent.attempt)}</span></li>)}</ol> : <Empty>No persisted agent events yet.</Empty>}</article>
         <article className="panel"><h3>Review & changes</h3>{detail.reviews.length ? <ul>{((detail.reviews[0].findings as unknown[]) ?? []).map((finding) => <li key={JSON.stringify(finding)}>{JSON.stringify(finding)}</li>)}</ul> : <Empty>No persisted reviewer findings.</Empty>}{coderEvent ? <p className="subtle">Changed: {Array.isArray((coderEvent.payload as Json).changedFiles) ? ((coderEvent.payload as Json).changedFiles as unknown[]).join(', ') : 'recorded by runtime'}</p> : null}<p className="subtle">Proposed changes remain separate from committed delivery.</p></article>
         <article className="panel delivery"><h3>Delivery</h3>{delivery.commit ? <><p>Commit <code>{text(delivery.commit.sha)}</code></p><p>Branch <code>{text(delivery.commit.branch)}</code></p><ul className="runs">{delivery.pushes.map((push) => <li key={String(push.id)}><span className={statusClass(push.status)}>{String(push.status)}</span> Push attempt {String(push.attempt)}<small>{text(push.error, '')}</small></li>)}</ul></> : <Empty>Approval and final verification are required before delivery.</Empty>}</article>
-        <article className="panel"><h3>Pull request</h3>{pr ? <><p><span className={statusClass(pr.status)}>PR #{String(pr.number)}</span></p><p>{text(pr.title)}</p><a className="button secondary" href={String(pr.url)} target="_blank" rel="noreferrer">Open GitHub PR ↗</a></> : <Empty>No persisted pull request.</Empty>}</article>
+        <article className="panel"><h3>Pull request</h3>{pr ? <><p><span className={statusClass(pr.remoteStatus ?? pr.status)}>PR #{String(pr.number)} · {String(pr.remoteStatus ?? 'UNREFRESHED')}</span></p><p>{text(pr.title)}</p><p className="subtle">Head: <code>{text(pr.headSha, 'Refresh to validate')}</code></p><div className="actions"><button className="button secondary" onClick={() => void action('refresh-pr')}>Refresh GitHub status</button><a className="button secondary" href={String(pr.url)} target="_blank" rel="noreferrer">Open GitHub PR ↗</a></div></> : <Empty>No persisted pull request.</Empty>}</article>
         <article className="panel"><h3>Evaluation</h3>{detail.evaluations.length ? <ul className="runs">{detail.evaluations.map((run) => <li key={String(run.id)}><span className={statusClass(run.technicalSuccess ? 'PASSED' : 'FAILED')}>{run.technicalSuccess ? 'TECHNICAL PASS' : 'TECHNICAL FAIL'}</span><small>{String(run.finalState)} · {String(run.durationMs)}ms · repairs {String(run.repairAttempts)}</small></li>)}</ul> : <Empty>Technical evaluation is recorded separately from delivery success.</Empty>}</article>
       </div>
     </section>

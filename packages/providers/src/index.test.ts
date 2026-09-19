@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { GitHubProvider, ProviderError } from './index.js';
+import { createHmac } from 'node:crypto';
+import { GitHubProvider, ProviderError, verifyGitHubWebhookSignature } from './index.js';
 const json =
   (data: unknown, status = 200) =>
   async () =>
@@ -86,5 +87,32 @@ describe('GitHubProvider', () => {
         expect.stringContaining('/repos/acme/demo/pulls/3'),
       ]),
     );
+  });
+  it('retrieves checks and uses controlled GitHub issue comments for PR feedback', async () => {
+    const provider = new GitHubProvider('token', async (input, init) => {
+      const path = String(input);
+      if (path.includes('/check-runs')) {
+        return new Response(JSON.stringify({ check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/demo/runs/1' }] }));
+      }
+      if (init?.method === 'POST') {
+        return new Response(JSON.stringify({ id: 9, body: 'Please review.', user: { login: 'codexflow' }, created_at: '2026-01-01T00:00:00Z' }), { status: 201 });
+      }
+      return new Response(JSON.stringify([{ id: 8, body: 'Looks good.', user: { login: 'human' }, created_at: '2026-01-01T00:00:00Z' }]));
+    });
+    await expect(provider.getCommitChecks({ owner: 'acme', name: 'demo', sha: 'abc123' })).resolves.toEqual([
+      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', url: 'https://github.com/acme/demo/runs/1' },
+    ]);
+    await expect(provider.listPullRequestComments({ owner: 'acme', name: 'demo', number: 3 })).resolves.toEqual([
+      { id: '8', body: 'Looks good.', author: 'human', createdAt: '2026-01-01T00:00:00Z' },
+    ]);
+    await expect(provider.createPullRequestComment({ owner: 'acme', name: 'demo', number: 3, body: 'Please review.' })).resolves.toMatchObject({ id: '9', author: 'codexflow' });
+  });
+  it('validates GitHub webhook signatures without exposing the secret', () => {
+    const secret = 'webhook-secret';
+    const payload = '{"action":"opened"}';
+    const valid = `sha256=${createHmac('sha256', secret).update(payload).digest('hex')}`;
+    expect(verifyGitHubWebhookSignature(secret, payload, valid)).toBe(true);
+    expect(verifyGitHubWebhookSignature(secret, payload, 'sha256=wrong')).toBe(false);
+    expect(verifyGitHubWebhookSignature('', payload, valid)).toBe(false);
   });
 });

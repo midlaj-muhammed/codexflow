@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { Provider } from '@codexflow/shared';
 
 export type RemoteRepository = {
@@ -20,6 +21,18 @@ export type RemotePullRequest = {
   status: 'OPEN' | 'CLOSED' | 'MERGED';
   /** The provider's current source commit when it exposes one. */
   headSha?: string;
+};
+export type RemoteCheck = {
+  name: string;
+  status: 'QUEUED' | 'IN_PROGRESS' | 'COMPLETED';
+  conclusion?: 'SUCCESS' | 'FAILURE' | 'NEUTRAL' | 'CANCELLED' | 'SKIPPED' | 'TIMED_OUT' | 'ACTION_REQUIRED';
+  url?: string;
+};
+export type RemotePullRequestComment = {
+  id: string;
+  body: string;
+  author: string;
+  createdAt: string;
 };
 export interface GitProvider {
   authenticate(token: string): Promise<{ login: string }>;
@@ -45,6 +58,14 @@ export interface GitProvider {
     name: string;
     number: number;
   }): Promise<RemotePullRequest>;
+  getCommitChecks?(input: { owner: string; name: string; sha: string }): Promise<RemoteCheck[]>;
+  listPullRequestComments?(input: { owner: string; name: string; number: number }): Promise<RemotePullRequestComment[]>;
+  createPullRequestComment?(input: {
+    owner: string;
+    name: string;
+    number: number;
+    body: string;
+  }): Promise<RemotePullRequestComment>;
 }
 export class ProviderError extends Error {
   constructor(
@@ -73,6 +94,31 @@ const pullRequestSchema = z.object({
   merged: z.boolean().optional(),
   head: z.object({ sha: z.string().min(1) }).optional(),
 });
+const checkRunSchema = z.object({
+  name: z.string(),
+  status: z.enum(['queued', 'in_progress', 'completed']),
+  conclusion: z.enum(['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required']).nullable(),
+  html_url: z.url().nullable(),
+});
+const commentSchema = z.object({
+  id: z.number(),
+  body: z.string(),
+  user: z.object({ login: z.string() }),
+  created_at: z.string(),
+});
+
+/**
+ * Verifies GitHub's sha256 webhook signature without ever logging the secret
+ * or body. Callers should reject unsigned events when a webhook secret is
+ * configured.
+ */
+export function verifyGitHubWebhookSignature(secret: string, rawBody: string, signature?: string): boolean {
+  if (!secret || !signature?.startsWith('sha256=')) return false;
+  const expected = `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+  const actualBytes = Buffer.from(signature);
+  const expectedBytes = Buffer.from(expected);
+  return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
+}
 export class GitHubProvider implements GitProvider {
   constructor(
     private readonly token: string,
@@ -228,5 +274,37 @@ export class GitHubProvider implements GitProvider {
         `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/pulls/${value.number}`,
       ),
     );
+  }
+  async getCommitChecks(input: { owner: string; name: string; sha: string }): Promise<RemoteCheck[]> {
+    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), sha: z.string().min(1) }).parse(input);
+    const raw = z.object({ check_runs: z.array(checkRunSchema) }).parse(
+      await this.request(
+        `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/commits/${encodeURIComponent(value.sha)}/check-runs`,
+      ),
+    );
+    return raw.check_runs.map((check) => ({
+      name: check.name,
+      status: check.status.toUpperCase() as RemoteCheck['status'],
+      conclusion: check.conclusion?.toUpperCase() as RemoteCheck['conclusion'],
+      url: check.html_url ?? undefined,
+    }));
+  }
+  async listPullRequestComments(input: { owner: string; name: string; number: number }): Promise<RemotePullRequestComment[]> {
+    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive() }).parse(input);
+    const raw = z.array(commentSchema).parse(
+      await this.request(`/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments?per_page=100`),
+    );
+    return raw.map((comment) => ({ id: String(comment.id), body: comment.body, author: comment.user.login, createdAt: comment.created_at }));
+  }
+  async createPullRequestComment(input: { owner: string; name: string; number: number; body: string }): Promise<RemotePullRequestComment> {
+    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive(), body: z.string().trim().min(1).max(10_000) }).parse(input);
+    const raw = commentSchema.parse(
+      await this.request(`/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ body: value.body }),
+      }),
+    );
+    return { id: String(raw.id), body: raw.body, author: raw.user.login, createdAt: raw.created_at };
   }
 }

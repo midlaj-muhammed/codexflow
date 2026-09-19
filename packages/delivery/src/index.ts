@@ -7,7 +7,13 @@ import {
 } from '@codexflow/agents';
 import { GitEngine, GitError } from '@codexflow/git';
 import type { CodexFlowStore, DeliveryStatus } from '@codexflow/database';
-import { ProviderError, type GitProvider, type RemotePullRequest } from '@codexflow/providers';
+import {
+  ProviderError,
+  type GitProvider,
+  type RemoteCheck,
+  type RemotePullRequest,
+  type RemotePullRequestComment,
+} from '@codexflow/providers';
 import type { EventBus, TaskLifecycleManager } from '@codexflow/runtime';
 export type CommitMetadata = { subject: string; body?: string };
 export type PullRequestMetadata = { title: string; body: string };
@@ -34,6 +40,7 @@ export type DeliveryRuntime = {
   lifecycle: Pick<TaskLifecycleManager, 'recordDeliveryState'>;
   events: Pick<EventBus, 'emit'>;
 };
+export type PullRequestRefresh = { pullRequest: RemotePullRequest; checks: RemoteCheck[] };
 export type DeliveryFailureClassification = 'BLOCKED' | 'RETRYABLE' | 'PERMANENT_FAILURE';
 export function classifyDeliveryFailure(error: unknown): DeliveryFailureClassification {
   if (error instanceof ProviderError)
@@ -199,10 +206,40 @@ export class DeliveryService {
       url: String(persisted.url),
       title: String(persisted.title),
       body: String(persisted.body),
-      status: 'OPEN' as const,
+      status: String(persisted.remoteStatus ?? 'OPEN') as RemotePullRequest['status'],
+      headSha: persisted.headSha ? String(persisted.headSha) : undefined,
     };
     record.pullRequest = pullRequest;
     return pullRequest;
+  }
+  /** Re-read the remote PR; a changed head is a delivery safety failure. */
+  async refreshPullRequest(record: DeliveryRecord, known?: RemotePullRequest): Promise<PullRequestRefresh> {
+    const commit = this.hydrateCommit(record);
+    const pullRequest = known ?? record.pullRequest ?? this.persistedPullRequest(record);
+    if (!commit || !pullRequest) throw new Error('A delivered pull request is required for refresh');
+    if (!this.provider.getPullRequest) throw new Error('Git provider does not support pull request refresh');
+    const remote = await this.provider.getPullRequest({ owner: record.owner, name: record.repository, number: pullRequest.number });
+    if (!remote.headSha || remote.headSha !== commit.sha)
+      throw new Error('Refreshed pull request does not reference the committed delivery SHA');
+    const persisted = this.store?.findSuccessfulDeliveryPullRequest(record.taskId, record.branch, commit.sha);
+    if (persisted) this.store?.updateDeliveryPullRequest(String(persisted.id), {
+      status: 'SUCCEEDED', number: remote.number, url: remote.url, remoteStatus: remote.status,
+      headSha: remote.headSha, refreshedAt: new Date().toISOString(),
+    });
+    record.pullRequest = remote;
+    const checks = this.provider.getCommitChecks
+      ? await this.provider.getCommitChecks({ owner: record.owner, name: record.repository, sha: commit.sha })
+      : [];
+    await this.emit(record, 'pr.completed', { number: remote.number, refreshed: true, checks: checks.length });
+    return { pullRequest: remote, checks };
+  }
+  /** Controlled feedback is server-side and allowed only after head-SHA revalidation. */
+  async commentPullRequest(record: DeliveryRecord, body: string): Promise<RemotePullRequestComment> {
+    if (!this.provider.createPullRequestComment) throw new Error('Git provider does not support pull request comments');
+    const refreshed = await this.refreshPullRequest(record);
+    const comment = await this.provider.createPullRequestComment({ owner: record.owner, name: record.repository, number: refreshed.pullRequest.number, body });
+    await this.emit(record, 'pr.completed', { number: refreshed.pullRequest.number, feedback: true, commentId: comment.id });
+    return comment;
   }
   async commit(record: DeliveryRecord, message = this.reporter.commit(record).subject) {
     await this.emit(record, 'commit.started');
@@ -317,6 +354,7 @@ export class DeliveryService {
     if (record.pullRequest) return record.pullRequest;
     const persisted = this.persistedPullRequest(record);
     if (persisted) {
+      await this.refreshPullRequest(record, persisted);
       await this.mark(record, 'PR_CREATED');
       await this.emit(record, 'pr.completed', { number: persisted.number, reused: true });
       return persisted;
@@ -348,6 +386,8 @@ export class DeliveryService {
         body: recovered.body,
         status: 'SUCCEEDED',
         attempt: this.nextAttempt(this.store?.listDeliveryPullRequests(record.taskId, commit.sha) ?? []),
+        remoteStatus: recovered.status,
+        headSha: recovered.headSha,
       });
       record.pullRequest = recovered;
       await this.mark(record, 'PR_CREATED');
@@ -394,6 +434,9 @@ export class DeliveryService {
           status: 'SUCCEEDED',
           number: pullRequest.number,
           url: pullRequest.url,
+          remoteStatus: pullRequest.status,
+          headSha: pullRequest.headSha,
+          refreshedAt: new Date().toISOString(),
         });
       record.pullRequest = pullRequest;
       await this.mark(record, 'PR_CREATED');

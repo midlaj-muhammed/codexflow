@@ -136,6 +136,30 @@ function service(input: {
 }
 
 describe('DeliveryService durable delivery', () => {
+  it('refreshes persisted GitHub PR state and rejects a moved PR head', async () => {
+    const { path, baseline } = fixture(true);
+    const { db, store, task } = createStore();
+    const workspace = workspaceStore(store, String(task.id), path, baseline);
+    const delivery = record({ taskId: String(task.id), workspaceId: workspace.id, path, baseline });
+    const approvals = new ApprovalService(store);
+    approvals.request(delivery.taskId, delivery.workspaceId, delivery.diff, delivery.risk);
+    approvals.approve(delivery.taskId, 'human', delivery.diff);
+    await service({ approvals, store }).deliver(delivery);
+    const commitSha = delivery.commit!.sha;
+    const refreshedProvider: GitProvider = {
+      ...provider(),
+      getPullRequest: async () => ({ id: '42', number: 42, url: 'https://github.com/a/b/pull/42', title: 'CodexFlow: t', body: 'ok', status: 'OPEN', headSha: commitSha }),
+      getCommitChecks: async () => [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS' }],
+      createPullRequestComment: async () => ({ id: 'comment-1', body: 'Verified', author: 'human', createdAt: '2026-01-01T00:00:00Z' }),
+    };
+    const refreshed = await new DeliveryService(new GitEngine(), approvals, new TesterAgent(), refreshedProvider, undefined, undefined, store).refreshPullRequest(delivery);
+    expect(refreshed).toMatchObject({ pullRequest: { headSha: commitSha }, checks: [{ conclusion: 'SUCCESS' }] });
+    expect(store.listDeliveryPullRequests(delivery.taskId, commitSha)).toEqual([
+      expect.objectContaining({ remoteStatus: 'OPEN', headSha: commitSha }),
+    ]);
+    await expect(new DeliveryService(new GitEngine(), approvals, new TesterAgent(), { ...refreshedProvider, getPullRequest: async () => ({ ...delivery.pullRequest!, headSha: 'wrong' }) }, undefined, undefined, store).refreshPullRequest(delivery)).rejects.toThrow('committed delivery SHA');
+    db.close();
+  });
   it('continues a real planner, coder, reviewer, tester, risk, approval, and delivery flow', async () => {
     const { path, baseline } = fixture(true);
     const { db, store, task } = createStore();

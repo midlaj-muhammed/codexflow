@@ -1,6 +1,6 @@
 import { ApprovalService, TesterAgent, type ProjectMetadata, scanProject } from '@codexflow/agents';
 import { CodexFlowStore, openDatabase } from '@codexflow/database';
-import { DeliveryService } from '@codexflow/delivery';
+import { DeliveryService, type DeliveryRecord } from '@codexflow/delivery';
 import { calculateEvaluationMetrics, ensureStarterBenchmark } from '@codexflow/evaluation';
 import { GitEngine } from '@codexflow/git';
 import { GitHubProvider } from '@codexflow/providers';
@@ -97,6 +97,43 @@ export async function deliverApprovedTask(taskId: string) {
     repository: String(snapshot.repository.name),
     baseBranch: String(snapshot.repository.defaultBranch),
   });
+}
+
+/** Revalidates a delivered PR from GitHub; the delivery SHA must still be its head. */
+export async function refreshTaskPullRequest(taskId: string) {
+  const { store, git, events } = controlPlane();
+  const snapshot = taskSnapshot(taskId);
+  if (!snapshot?.workspace || !snapshot.repository || !snapshot.delivery.commit || !snapshot.approval)
+    throw new Error('Pull request delivery context is unavailable');
+  const pullRequest = snapshot.delivery.pullRequests.find((entry) => entry.status === 'SUCCEEDED');
+  if (!pullRequest?.number) throw new Error('No delivered pull request is available');
+  const token = process.env.CODEXFLOW_GITHUB_TOKEN ?? process.env.CODEXFLOW_GITHUB_E2E_TOKEN;
+  if (!token) throw new Error('GitHub delivery provider is not configured');
+  const metadata = (snapshot.project?.metadata ?? {}) as Record<string, unknown>;
+  const record: DeliveryRecord = {
+    taskId,
+    workspaceId: String(snapshot.workspace.id),
+    workspacePath: String(snapshot.workspace.rootPath),
+    branch: String(snapshot.workspace.branch),
+    baselineCommit: String(snapshot.workspace.baselineCommit),
+    diff: '',
+    changedFiles: [],
+    verification: { commands: [typeof metadata.testCommand === 'string' ? metadata.testCommand : 'git diff --check'], requiresNewTests: false, rationale: 'Persisted delivery refresh' },
+    risk: snapshot.approval.risk,
+    owner: String(snapshot.repository.owner),
+    repository: String(snapshot.repository.name),
+    baseBranch: String(snapshot.repository.defaultBranch),
+    commit: { sha: String(snapshot.delivery.commit.sha), message: String(snapshot.delivery.commit.message) },
+    pullRequest: {
+      id: String(pullRequest.number), number: Number(pullRequest.number), url: String(pullRequest.url),
+      title: String(pullRequest.title), body: String(pullRequest.body),
+      status: String(pullRequest.remoteStatus ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
+      headSha: pullRequest.headSha ? String(pullRequest.headSha) : undefined,
+    },
+  };
+  const delivery = new DeliveryService(git, new ApprovalService(store), new TesterAgent(), new GitHubProvider(token), undefined, undefined, store,
+    { lifecycle: { recordDeliveryState: async (_taskId, status) => status }, events });
+  return delivery.refreshPullRequest(record);
 }
 
 export async function importLocalRepository(input: {

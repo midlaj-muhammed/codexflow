@@ -100,6 +100,9 @@ const migrations = [
    ALTER TABLE evaluation_runs ADD COLUMN planned_stages TEXT NOT NULL DEFAULT '[]';
    ALTER TABLE evaluation_runs ADD COLUMN executed_stages TEXT NOT NULL DEFAULT '[]';
    ALTER TABLE evaluation_runs ADD COLUMN specialist_outcomes TEXT NOT NULL DEFAULT '{}';`,
+  `ALTER TABLE delivery_pull_requests ADD COLUMN remote_status TEXT;
+   ALTER TABLE delivery_pull_requests ADD COLUMN head_sha TEXT;
+   ALTER TABLE delivery_pull_requests ADD COLUMN refreshed_at TEXT;`,
 ];
 
 export type DeliveryStatus =
@@ -879,12 +882,14 @@ export class CodexFlowStore {
     status: DeliveryAttemptStatus;
     error?: string;
     attempt: number;
+    remoteStatus?: string;
+    headSha?: string;
   }) {
     const id = randomUUID(),
       createdAt = now();
     this.db
       .prepare(
-        'INSERT INTO delivery_pull_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO delivery_pull_requests (id, task_id, workspace_id, provider, repository, branch, base_branch, commit_sha, number, url, title, body, status, error, attempt, created_at, completed_at, remote_status, head_sha, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         id,
@@ -904,6 +909,9 @@ export class CodexFlowStore {
         input.attempt,
         createdAt,
         input.status === 'SUCCEEDED' || input.status === 'FAILED' ? createdAt : null,
+        input.remoteStatus ?? null,
+        input.headSha ?? null,
+        input.status === 'SUCCEEDED' ? createdAt : null,
       );
     return id;
   }
@@ -914,27 +922,30 @@ export class CodexFlowStore {
       number?: number;
       url?: string;
       error?: string;
+      remoteStatus?: string;
+      headSha?: string;
+      refreshedAt?: string;
     },
   ) {
     const completedAt = input.status === 'PENDING' ? null : now();
     const result = this.db
       .prepare(
-        'UPDATE delivery_pull_requests SET status = ?, number = COALESCE(?, number), url = COALESCE(?, url), error = ?, completed_at = ? WHERE id = ?',
+        'UPDATE delivery_pull_requests SET status = ?, number = COALESCE(?, number), url = COALESCE(?, url), error = ?, completed_at = ?, remote_status = COALESCE(?, remote_status), head_sha = COALESCE(?, head_sha), refreshed_at = COALESCE(?, refreshed_at) WHERE id = ?',
       )
-      .run(input.status, input.number ?? null, input.url ?? null, input.error ?? null, completedAt, id);
+      .run(input.status, input.number ?? null, input.url ?? null, input.error ?? null, completedAt, input.remoteStatus ?? null, input.headSha ?? null, input.refreshedAt ?? null, id);
     if (result.changes !== 1) throw new Error(`Delivery pull request not found: ${id}`);
   }
   listDeliveryPullRequests(taskId: string, commitSha: string) {
     return this.db
       .prepare(
-        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pull_requests WHERE task_id = ? AND commit_sha = ? ORDER BY attempt ASC, created_at ASC',
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt, remote_status AS remoteStatus, head_sha AS headSha, refreshed_at AS refreshedAt FROM delivery_pull_requests WHERE task_id = ? AND commit_sha = ? ORDER BY attempt ASC, created_at ASC',
       )
       .all(taskId, commitSha) as Record<string, unknown>[];
   }
   findSuccessfulDeliveryPullRequest(taskId: string, branch: string, commitSha: string) {
     return this.db
       .prepare(
-        "SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pull_requests WHERE task_id = ? AND branch = ? AND commit_sha = ? AND status = 'SUCCEEDED' ORDER BY completed_at DESC LIMIT 1",
+        "SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt, remote_status AS remoteStatus, head_sha AS headSha, refreshed_at AS refreshedAt FROM delivery_pull_requests WHERE task_id = ? AND branch = ? AND commit_sha = ? AND status = 'SUCCEEDED' ORDER BY completed_at DESC LIMIT 1",
       )
       .get(taskId, branch, commitSha) as Record<string, unknown> | undefined;
   }
