@@ -2,9 +2,9 @@
 
 ## Status
 
-FAIL
+PASS
 
-Phase 15 runtime-control implementation is complete, but Phase 15 cannot be marked PASS because the required explicit GitHub E2E regression failed in the configured disposable environment. The failure is delivery safety doing the right thing: an existing remote pull request for the configured branch did not reference the newly committed delivery SHA, so delivery refused to continue.
+Phase 15 runtime-control implementation and all required regression evidence pass. The initial GitHub E2E failure was confirmed as disposable-fixture drift, not an application defect: the configured branch already had a historical pull request, which intentionally did not match the new delivery commit. The stale PR was closed and the explicitly configured disposable worktree was moved to a fresh branch from `origin/main`; delivery SHA verification remained unchanged and the real E2E passed.
 
 ## Objective
 
@@ -83,12 +83,21 @@ Status: CLOSED
 
 ### Blocker 6: Phase 13 external/browser/OpenAI/GitHub regression results are documented
 
-Evidence:
+Root cause and repair:
+- The prior configured E2E branch `codexflow/e2e-phase13-final-20260920` had an existing PR whose head was `a12f8a55caa6afaa6c32a7eaceff9cc75af1dedd`.
+- The E2E correctly created and pushed a newer delivery commit, then `DeliveryService.createPullRequest` rejected reuse of that PR because its head SHA differed.
+- GitHub retains closed PRs in `state=all`, so merely closing that old PR cannot make its branch reusable under the reconciliation policy.
+- Only the disposable fixture was changed: the stale PR was closed and `/tmp/codexflow-github-e2e` was switched to the fresh disposable branch `codexflow/e2e-phase15-20260920` from `origin/main`. No application or delivery code changed.
+
+Final evidence:
 - `pnpm test:e2e` PASS.
 - `pnpm test:openai-e2e` PASS.
-- `pnpm test:github-e2e` FAIL: `Existing pull request does not reference the committed delivery SHA`.
+- `pnpm test:github-e2e` PASS on the first fresh branch, then PASS again during final revalidation on a second fresh disposable branch.
+- Final delivery commit SHA: `94362531e3ac14eef4f44856cca77a26f29771f8`.
+- Final remote branch SHA: `94362531e3ac14eef4f44856cca77a26f29771f8`.
+- Final GitHub PR #8 head SHA: `94362531e3ac14eef4f44856cca77a26f29771f8`.
 
-Status: FAILING EXTERNAL REGRESSION
+Status: CLOSED
 
 ## Strategies
 
@@ -151,7 +160,7 @@ Phase 14 evaluation remains compatible and now records:
 
 - `pnpm test:e2e` - PASS (web Playwright health/control-plane smoke)
 - `pnpm test:openai-e2e` - PASS (real OpenAI runtime and repair E2E)
-- `pnpm test:github-e2e` - FAIL (`Existing pull request does not reference the committed delivery SHA`)
+- `pnpm test:github-e2e` - PASS (real commit, push, PR creation/retrieval, and SHA verification)
 
 ## Phase 14 Regression
 
@@ -170,13 +179,13 @@ Phase 14 evaluation remains compatible and now records:
 - Timeout/cancellation/budget failures emit safe metadata only.
 - TestGenerator/Repair/Coder continue using the existing workspace edit policy.
 - Runtime cancellation does not bypass approval or delivery.
-- GitHub delivery safety remained enforced and blocked the mismatched-PR E2E instead of accepting an unsafe remote state.
+- GitHub delivery safety remained enforced: the stale PR mismatch was rejected, then the fresh fixture run verified `delivery commit SHA == remote branch SHA == PR head SHA`.
 
 ## Known Limitations
 
 - Provider exactly-once execution is not claimed for crashes before AgentRun completion.
-- External GitHub E2E is currently failing because the configured disposable remote branch/PR state is not aligned with the newly created delivery commit.
+- GitHub E2E branches are intentionally single-use under all-state PR reconciliation; a rerun requires a fresh explicitly configured disposable branch after prior PR history exists.
 
 ## Final Acceptance
 
-Implementation blockers 1-5 are closed. Phase 15 remains not PASS because blocker 6 produced a real failing GitHub E2E regression.
+All six prior blockers are closed. Strategy-dependent execution, runtime controls, recovery/provenance, and browser/OpenAI/GitHub regressions have direct passing evidence. No delivery safety invariant was weakened.
