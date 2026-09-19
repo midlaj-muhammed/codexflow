@@ -2,6 +2,7 @@ import { readFile, readdir, writeFile } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 export type ProjectMetadata = {
   language: string[];
@@ -384,6 +385,136 @@ export class VerificationRepairLoop {
       tests,
       repairs: this.maxRepairs,
     };
+  }
+}
+
+export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+export type RiskResult = { level: RiskLevel; score: number; reasons: string[] };
+export type RiskInput = {
+  changedFiles: string[];
+  additions: number;
+  deletions: number;
+  failedChecks?: string[];
+  reviewerFindings?: ReviewFinding[];
+  destructiveOperation?: boolean;
+};
+const weightedSignals: [RegExp, number, string][] = [
+  [
+    /(auth|login|session|permission|role|acl)/i,
+    35,
+    'Authentication or authorization-related file changed',
+  ],
+  [/(payment|billing|stripe)/i, 35, 'Payment-related file changed'],
+  [/(migration|schema|database|prisma)/i, 30, 'Database/schema file changed'],
+  [/(package\.json|lock$)/i, 20, 'Dependency manifest changed'],
+  [/(\.env|secret|credential|\.pem|\.key)/i, 60, 'Secret-related file changed'],
+  [
+    /(docker|terraform|\.github\/workflows|deploy|config)/i,
+    20,
+    'Infrastructure/configuration file changed',
+  ],
+];
+export class RiskEngine {
+  assess(input: RiskInput): RiskResult {
+    let score = 0;
+    const reasons: string[] = [];
+    const paths = input.changedFiles.join('\n');
+    for (const [pattern, weight, reason] of weightedSignals)
+      if (pattern.test(paths)) {
+        score += weight;
+        reasons.push(reason);
+      }
+    if (input.deletions > 0) {
+      score += 10;
+      reasons.push('File content was deleted');
+    }
+    if (input.additions + input.deletions > 500) {
+      score += 20;
+      reasons.push('Large diff');
+    }
+    for (const check of input.failedChecks ?? []) {
+      score += 20;
+      reasons.push(`Verification failed: ${check}`);
+    }
+    for (const finding of input.reviewerFindings ?? [])
+      if (finding.severity === 'HIGH') {
+        score += 30;
+        reasons.push(`Reviewer finding: ${finding.message}`);
+      }
+    if (input.destructiveOperation) {
+      score += 60;
+      reasons.push('Destructive operation requested');
+    }
+    const bounded = Math.min(score, 100);
+    return {
+      level: bounded >= 50 ? 'HIGH' : bounded >= 20 ? 'MEDIUM' : 'LOW',
+      score: bounded,
+      reasons: reasons.length ? reasons : ['No deterministic high-risk signals detected'],
+    };
+  }
+}
+export type ApprovalState = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CANCELLED';
+export type Approval = {
+  taskId: string;
+  workspaceId: string;
+  fingerprint: string;
+  risk: RiskResult;
+  state: ApprovalState;
+  approvedBy?: string;
+  approvedAt?: string;
+};
+export class ApprovalService {
+  private approvals = new Map<string, Approval>();
+  fingerprint(diff: string) {
+    return createHash('sha256').update(diff).digest('hex');
+  }
+  request(taskId: string, workspaceId: string, diff: string, risk: RiskResult) {
+    const approval: Approval = {
+      taskId,
+      workspaceId,
+      fingerprint: this.fingerprint(diff),
+      risk,
+      state: 'PENDING',
+    };
+    this.approvals.set(taskId, approval);
+    return approval;
+  }
+  approve(taskId: string, actor: string, diff: string) {
+    const approval = this.require(taskId);
+    if (approval.state !== 'PENDING' || approval.fingerprint !== this.fingerprint(diff))
+      throw new Error('Approval is not valid for the current diff');
+    approval.state = 'APPROVED';
+    approval.approvedBy = actor;
+    approval.approvedAt = new Date().toISOString();
+    return approval;
+  }
+  reject(taskId: string) {
+    const approval = this.require(taskId);
+    approval.state = 'REJECTED';
+    return approval;
+  }
+  invalidateIfChanged(taskId: string, diff: string) {
+    const approval = this.require(taskId);
+    if (approval.fingerprint !== this.fingerprint(diff) && approval.state === 'APPROVED')
+      approval.state = 'EXPIRED';
+    return approval;
+  }
+  assertMayApply(taskId: string, diff: string) {
+    const approval = this.invalidateIfChanged(taskId, diff);
+    if (
+      approval.state === 'REJECTED' ||
+      approval.state === 'EXPIRED' ||
+      approval.state === 'CANCELLED'
+    )
+      throw new Error(`Task cannot proceed with approval state ${approval.state}`);
+    if (approval.risk.level === 'HIGH' && approval.state !== 'APPROVED')
+      throw new Error('High-risk task requires explicit human approval');
+    return approval;
+  }
+  private require(taskId: string) {
+    const approval = this.approvals.get(taskId);
+    if (!approval) throw new Error(`No approval for task: ${taskId}`);
+    return approval;
   }
 }
 export type TestExecution = {

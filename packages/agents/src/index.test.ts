@@ -10,9 +10,11 @@ import {
   OpenAIResponsesProvider,
   PlannerAgent,
   ReviewerAgent,
+  RiskEngine,
   SupervisorAgent,
   TesterAgent,
   VerificationRepairLoop,
+  ApprovalService,
   scanProject,
 } from './index.js';
 describe('scanner and mock provider', () => {
@@ -188,5 +190,28 @@ describe('scanner and mock provider', () => {
       repairs: 1,
       tests: [expect.objectContaining({ status: 'PASSED' })],
     });
+  });
+  it('produces explainable deterministic high risk and enforces approval', () => {
+    const risk = new RiskEngine().assess({
+      changedFiles: ['src/auth.ts', '.env'],
+      additions: 2,
+      deletions: 0,
+      failedChecks: ['test'],
+    });
+    const approvals = new ApprovalService();
+    approvals.request('t', 'w', 'diff', risk);
+    expect(risk).toMatchObject({
+      level: 'HIGH',
+      reasons: expect.arrayContaining(['Authentication or authorization-related file changed']),
+    });
+    expect(() => approvals.assertMayApply('t', 'diff')).toThrow('requires explicit');
+    approvals.approve('t', 'human', 'diff');
+    expect(approvals.assertMayApply('t', 'diff').state).toBe('APPROVED');
+  });
+  it('invalidates an approval after workspace diff changes', () => {
+    const approvals = new ApprovalService();
+    approvals.request('t', 'w', 'before', { level: 'HIGH', score: 80, reasons: ['x'] });
+    approvals.approve('t', 'human', 'before');
+    expect(() => approvals.assertMayApply('t', 'after')).toThrow('EXPIRED');
   });
 });
