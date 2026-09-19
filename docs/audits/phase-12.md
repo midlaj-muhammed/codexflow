@@ -2,7 +2,7 @@
 
 ## Status
 
-BLOCKED — REAL GITHUB ENVIRONMENT UNAVAILABLE
+BLOCKED — REAL GITHUB E2E WORKSPACE PREFLIGHT FAILED
 
 ## Objective
 
@@ -13,9 +13,10 @@ Verify and harden the production delivery runtime from approval through persiste
 - Local deterministic environment: available.
 - File-backed SQLite: verified by delivery restart tests.
 - Temporary bare Git remotes: verified by delivery integration tests.
-- Dedicated disposable GitHub repository, authenticated task workspace, and opt-in E2E configuration: unavailable.
+- Opt-in E2E configuration: present. The preflight confirmed E2E was enabled, every required variable was non-empty, and the token was present without reading or logging its value.
+- Configured workspace: `/tmp/codexflow-github-e2e` exists but is not a Git work tree. `GitEngine.inspect` correctly rejected it before any repository mutation or GitHub API request.
 
-The following required variables were not jointly configured: `CODEXFLOW_GITHUB_E2E_ENABLED=true`, `CODEXFLOW_GITHUB_E2E_TOKEN`, `CODEXFLOW_GITHUB_E2E_OWNER`, `CODEXFLOW_GITHUB_E2E_REPOSITORY`, `CODEXFLOW_GITHUB_E2E_BASE_BRANCH`, `CODEXFLOW_GITHUB_E2E_WORKSPACE`, and `CODEXFLOW_GITHUB_E2E_CHANGED_FILE`. No credential values were inspected or logged.
+The test uses `CODEXFLOW_GITHUB_E2E_ENABLED`, `CODEXFLOW_GITHUB_E2E_TOKEN`, `CODEXFLOW_GITHUB_E2E_OWNER`, `CODEXFLOW_GITHUB_E2E_REPOSITORY`, `CODEXFLOW_GITHUB_E2E_BASE_BRANCH`, `CODEXFLOW_GITHUB_E2E_WORKSPACE`, and `CODEXFLOW_GITHUB_E2E_CHANGED_FILE`. No credential values were inspected or logged.
 
 ## Implemented Hardening
 
@@ -55,20 +56,15 @@ Delivery publishes its existing EventBus events with safe task/workspace/branch 
 
 ## Tests Executed
 
-- `pnpm --filter @codexflow/delivery test` — PASS: deterministic delivery, real local bare-remote, retry, restart, idempotency, approval, lifecycle, observability, and failure classification coverage; real GitHub E2E skipped because configuration was absent.
-- `pnpm --filter @codexflow/agents test` — PASS: includes agent timeout and persisted approval hydration coverage.
-- `pnpm --filter @codexflow/database test` — PASS: includes approval persistence migration coverage.
-- `pnpm --filter @codexflow/providers test` — PASS: includes provider timeout and PR lookup/retrieval coverage.
-- `pnpm --filter @codexflow/runtime test` — PASS.
-- `pnpm --filter @codexflow/git test` — PASS.
+- `pnpm test:github-e2e` — FAIL: the configured test executed and failed at `GitEngine.inspect` with `Not a Git repository` for `/tmp/codexflow-github-e2e`. This occurred before the first GitHub request, file mutation, commit, push, or PR attempt.
 - `pnpm lint` — PASS.
 - `pnpm typecheck` — PASS.
-- `pnpm test` — PASS: all workspace package tests passed; the opt-in real GitHub E2E remained skipped.
+- `pnpm test` — PASS: all deterministic workspace package tests passed. The opt-in GitHub test was skipped by this command because it does not load `.env`.
 - `pnpm test:e2e` — PASS: 1 Playwright health smoke test.
 
 ## Real GitHub E2E
 
-BLOCKED. The opt-in E2E test is implemented in `packages/delivery/src/github.e2e.test.ts`, but no safe disposable GitHub repository/workspace configuration is available. No real repository, commit SHA, or PR URL can be truthfully reported for this phase.
+FAIL. The opt-in E2E test in `packages/delivery/src/github.e2e.test.ts` executed with its environment configuration, but the configured workspace was not a Git repository. No GitHub request or external mutation occurred, so no commit SHA, branch, PR number, or PR URL can be truthfully reported.
 
 ## Problems Found
 
@@ -86,8 +82,10 @@ BLOCKED. The opt-in E2E test is implemented in `packages/delivery/src/github.e2e
 
 ## Remaining Blockers
 
-- A dedicated disposable GitHub repository, authenticated isolated workspace, and opt-in environment configuration are required to execute and verify the real external commit/push/PR/restart workflow.
+- Populate `/tmp/codexflow-github-e2e` with a clone of the dedicated disposable repository and check out a clean, non-base task branch.
+- Configure write authentication for that clone's `origin` using a local credential helper or SSH; do not embed a token in its remote URL.
+- Rerun `pnpm test:github-e2e`. Only a passing execution can verify the real commit, push, PR retrieval, persisted record, idempotency, and recovery path.
 
 ## Final Decision
 
-BLOCKED — deterministic hardening is complete, but the mandatory real GitHub E2E has not executed.
+BLOCKED — deterministic hardening is complete, but the mandatory real GitHub E2E failed workspace preflight and did not reach GitHub.
