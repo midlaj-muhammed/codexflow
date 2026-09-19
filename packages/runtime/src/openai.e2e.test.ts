@@ -4,7 +4,7 @@ import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { OpenAIResponsesProvider } from '@codexflow/agents';
+import { OpenAIResponsesProvider, type StructuredCoderProvider } from '@codexflow/agents';
 import { CodexFlowStore, openDatabase } from '@codexflow/database';
 import { GitEngine } from '@codexflow/git';
 import { WorkspaceManager } from '@codexflow/workspace';
@@ -145,6 +145,44 @@ describeRealOpenAi('RuntimeExecutor real OpenAI E2E', () => {
     expect(persisted).not.toContain(apiKey);
     expect(persisted).not.toContain('Bearer ');
     expect(persisted).not.toContain('Authorization');
+  }, 120_000);
+
+  it('uses a real OpenAI structured response to repair an actual failed verification', async () => {
+    const apiKey = process.env.OPENAI_API_KEY;
+    expect(Boolean(apiKey)).toBe(true);
+    const fixture = await createFixture();
+    let realRequestCount = 0;
+    const openai = new OpenAIResponsesProvider(apiKey!, 'gpt-5', async (url, init) => {
+      realRequestCount += 1;
+      return fetch(url, init);
+    });
+    let calls = 0;
+    const provider: StructuredCoderProvider = {
+      runCoder: async (input) => {
+        calls += 1;
+        // The initial bad edit is a deterministic test boundary. Repair itself
+        // is the production OpenAI provider call being proven here.
+        if (calls === 1)
+          return { edits: [{ path: 'src/math.js', content: 'export function add(a, b) {\n  return a - b;\n}\n' }] };
+        return openai.runCoder(input);
+      },
+    };
+    const result = await new RuntimeExecutor({
+      store: fixture.store,
+      provider,
+      workspaceManager: new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')),
+    }).execute(String(fixture.task.id));
+
+    expect(realRequestCount).toBe(1);
+    expect(result).toMatchObject({ status: 'SUCCEEDED', finalState: 'READY_FOR_APPROVAL', repairAttempts: 1 });
+    expect(readFileSync(join(result.workspace!.rootPath, 'src', 'math.js'), 'utf8')).toMatch(/return\s+a\s*\+\s*b/);
+    expect(readFileSync(join(fixture.repositoryPath, 'src', 'math.js'), 'utf8')).toContain('return 0');
+    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'REPAIR', status: 'COMPLETED' }),
+    ]));
+    expect(fixture.store.listReviews(String(fixture.task.id))).toHaveLength(2);
+    expect(fixture.store.listTestRuns(String(fixture.task.id))).toHaveLength(2);
+    expect(JSON.stringify({ runs: fixture.store.listAgentRuns(String(fixture.task.id)), tests: fixture.store.listTestRuns(String(fixture.task.id)) })).not.toContain(apiKey);
   }, 120_000);
 });
 

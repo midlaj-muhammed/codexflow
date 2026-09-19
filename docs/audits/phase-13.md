@@ -2,7 +2,7 @@
 
 ## Status
 
-BLOCKED
+PASS
 
 ## Objective
 
@@ -105,13 +105,24 @@ The dashboard supports importing a local repository, deterministic project scann
 - Phase 12 real GitHub E2E — PASS.
 - No delivery, approval, GitHub, or Phase 10-12 recovery source changes were made for Phase 13C.
 
+## Phase 13H — Provider-Backed Repair
+
+- `RuntimeExecutor` now invokes the existing `VerificationRepairLoop` when the initial review/verification result requires repair.
+- Each repair obtains a new validated `CoderModelOutput` through the injected `StructuredCoderProvider`; production continues to use `OpenAIResponsesProvider` with no mock fallback.
+- The repair prompt contains the task, workspace context, repair attempt, reviewer findings, failed command, exit code, and bounded safe test output. It contains no environment values or credentials.
+- Repairs are applied only by the existing `RepairAgent` inside the isolated workspace. The executor re-collects the actual Git diff, re-enters `REVIEWING`, then performs a fresh `TESTING` run before it can request approval.
+- The existing repair limit remains bounded by `VerificationRepairLoop`. Exhausted repair remains `BLOCKED`; provider failure and malformed structured output remain truthful runtime failures.
+- Repair boundaries persist as `REPAIR` AgentRuns/events. The post-repair Reviewer and Tester runs create additional persisted Review and TestRun records; history is retained rather than overwritten.
+- Deterministic coverage proves failed verification → repair → reviewer → tester → `READY_FOR_APPROVAL`, with two review/test records, a persisted repair run, isolated source repository, and execution lease behavior.
+- Real repair E2E: `pnpm test:openai-e2e` — PASS. A deterministic initial bad edit made the actual test fail; one real OpenAI repair request returned validated structured edits, the repaired worktree passed review and `node tests/math.test.js`, persisted a REPAIR run plus second Review/TestRun, and reached `READY_FOR_APPROVAL`. The source repository remained unchanged.
+
 ## Remaining Blockers
 
-- Provider-backed automated repair is not implemented. `VerificationRepairLoop` is present, but it cannot yet re-enter `CoreAgentPipeline` with a failure-aware structured provider request and a review-before-retest lifecycle transition without adding a new pipeline path. Failed verification is truthfully persisted as `BLOCKED`; it is never reported as approval-ready.
+- None.
 
 ## Final Decision
 
-BLOCKED — Phase 13D–F are implemented and externally verified, but provider-backed repair remains a required runtime capability before the entire phase can be marked PASS.
+PASS — browser-driven real execution, bounded provider-backed repair, backend approval, durable delivery, GitHub PR verification, persistence, and regression coverage are implemented and evidenced.
 
 ## Next Phase Readiness
 
@@ -155,4 +166,4 @@ BLOCKED — Phase 13D–F are implemented and externally verified, but provider-
 
 ## Final Limitation
 
-The complete browser-to-GitHub path, approval, durable delivery, PR retrieval, persistence, and cross-process execution lease are implemented and evidenced. Automated provider-backed repair remains the sole Phase 13 blocker; test/review failures are correctly persisted and blocked instead of fabricated as success.
+The complete browser-to-GitHub path, bounded provider-backed repair, approval, durable delivery, PR retrieval, persistence, and cross-process execution lease are implemented and evidenced.

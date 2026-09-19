@@ -281,6 +281,30 @@ describe('runtime', () => {
       expect.objectContaining({ command: 'test -f missing.txt', status: 'FAILED' }),
     ]);
   });
+  it('repairs a failed verification with the injected structured provider, then re-reviews and re-tests', async () => {
+    const fixture = await runtimeFixture('test "$(cat src/message.txt)" = fixed');
+    const outputs = ['broken', 'fixed'];
+    const repairProvider: StructuredCoderProvider = {
+      runCoder: async () => ({
+        edits: [{ path: 'src/message.txt', content: outputs.shift()! }],
+        explanation: 'deterministic repair fixture',
+      }),
+    };
+    const result = await executorFor(fixture, repairProvider).execute(String(fixture.task.id));
+    expect(result).toMatchObject({
+      status: 'SUCCEEDED',
+      finalState: 'READY_FOR_APPROVAL',
+      repairAttempts: 1,
+      tests: [expect.objectContaining({ status: 'PASSED' })],
+    });
+    expect(readFileSync(join(result.workspace!.rootPath, 'src', 'message.txt'), 'utf8')).toBe('fixed');
+    expect(readFileSync(join(fixture.repositoryPath, 'src', 'message.txt'), 'utf8')).toBe('hello');
+    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'REPAIR', status: 'COMPLETED' }),
+    ]));
+    expect(fixture.store.listReviews(String(fixture.task.id))).toHaveLength(2);
+    expect(fixture.store.listTestRuns(String(fixture.task.id))).toHaveLength(2);
+  });
   it('rejects invalid tasks, invalid states, duplicate active execution, and missing providers', async () => {
     const missingStore = new CodexFlowStore(openDatabase());
     await expect(new RuntimeExecutor({ store: missingStore }).execute('missing')).resolves.toMatchObject(

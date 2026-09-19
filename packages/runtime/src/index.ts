@@ -5,6 +5,10 @@ import { join } from 'node:path';
 import {
   CoreAgentPipeline,
   ApprovalService,
+  RepairAgent,
+  ReviewerAgent,
+  TesterAgent,
+  VerificationRepairLoop,
   OpenAIResponsesProvider,
   RiskEngine,
   scanProject,
@@ -408,6 +412,7 @@ export class RuntimeExecutor {
     let diff = '';
     let review: ReviewerResult | undefined;
     let tests: TestExecution[] = [];
+    let repairAttempts = 0;
     const stageRuns = new Map<PipelineStage, string>();
 
     try {
@@ -490,8 +495,69 @@ export class RuntimeExecutor {
       diff = result.code.diff ?? diff;
       review = result.review;
       tests = result.tests;
+      let readyForApproval = result.next === 'READY_FOR_APPROVAL';
 
-      if (result.next === 'READY_FOR_APPROVAL') {
+      if (!readyForApproval) {
+        const repair = await new VerificationRepairLoop(new TesterAgent()).run({
+          workspacePath: workspace.rootPath,
+          plan: result.plan.verification,
+          repair: async (attempt) => {
+            const failureContext = this.repairFailureContext(review, tests, attempt);
+            const output = await this.runCoderProvider(
+              task,
+              workspace!,
+              metadata,
+              result.plan,
+              attempt + 1,
+              stageRuns.get('REPAIR'),
+              failureContext,
+            );
+            await new RepairAgent().applyEdits(workspace!.rootPath, output.edits);
+            const observed = await this.collectDiff(workspace!.rootPath);
+            diff = observed.diff;
+            changedFiles = observed.changedFiles;
+          },
+          onStage: async (event) => {
+            currentState = await this.handleStage(
+              taskId,
+              workspace!,
+              event,
+              currentState!,
+              stageRuns,
+              stages,
+            );
+          },
+        });
+        repairAttempts = repair.repairs;
+        if (repair.status !== 'PASSED') {
+          currentState = await this.transition(taskId, currentState!, 'BLOCKED');
+          throw new RuntimeExecutorError('REPAIR_REQUIRED', 'Verification remained failed after repair attempts');
+        }
+
+        // VerificationRepairLoop applies the repair; re-review and re-run the
+        // real tests against that repaired diff before approval is possible.
+        const observed = await this.collectDiff(workspace.rootPath);
+        diff = observed.diff;
+        changedFiles = observed.changedFiles;
+        const reviewStart: PipelineStageEvent = { stage: 'REVIEWER', status: 'STARTED', at: new Date().toISOString() };
+        currentState = await this.handleStage(taskId, workspace, reviewStart, currentState!, stageRuns, stages);
+        review = new ReviewerAgent().review({ changedFiles, diff });
+        const reviewComplete: PipelineStageEvent = { stage: 'REVIEWER', status: 'COMPLETED', at: new Date().toISOString(), result: review };
+        currentState = await this.handleStage(taskId, workspace, reviewComplete, currentState!, stageRuns, stages);
+        const testerStart: PipelineStageEvent = { stage: 'TESTER', status: 'STARTED', at: new Date().toISOString() };
+        currentState = await this.handleStage(taskId, workspace, testerStart, currentState!, stageRuns, stages);
+        tests = await new TesterAgent().verify(workspace.rootPath, result.plan.verification);
+        const testerComplete: PipelineStageEvent = { stage: 'TESTER', status: 'COMPLETED', at: new Date().toISOString(), result: { tests, passed: tests.every((test) => test.status === 'PASSED') } };
+        currentState = await this.handleStage(taskId, workspace, testerComplete, currentState!, stageRuns, stages);
+        readyForApproval = review.verdict === 'APPROVED' && tests.every((test) => test.status === 'PASSED');
+        if (!readyForApproval) {
+          currentState = await this.transition(taskId, currentState!, 'REPAIRING');
+          currentState = await this.transition(taskId, currentState, 'BLOCKED');
+          throw new RuntimeExecutorError('REPAIR_REQUIRED', 'Repaired workspace did not pass review and verification');
+        }
+      }
+
+      if (readyForApproval) {
         const approval = new ApprovalService(this.store).request(
           taskId,
           workspace.id,
@@ -515,16 +581,11 @@ export class RuntimeExecutor {
           diff,
           review,
           tests,
-          repairAttempts: 0,
+          repairAttempts,
         };
       }
 
-      currentState = await this.transition(taskId, currentState!, 'REPAIRING');
-      currentState = await this.transition(taskId, currentState, 'BLOCKED');
-      throw new RuntimeExecutorError(
-        'REPAIR_REQUIRED',
-        'Pipeline requires repair; provider-backed repair is not implemented in RuntimeExecutor yet',
-      );
+      throw new RuntimeExecutorError('REPAIR_REQUIRED', 'Pipeline requires repair');
     } catch (error) {
       const failure =
         error instanceof RuntimeExecutorError
@@ -648,6 +709,7 @@ export class RuntimeExecutor {
     plan: PlannerResult,
     attempt: number,
     runId?: string,
+    repairContext?: string,
   ): Promise<CoderModelOutput> {
     if (!this.provider)
       throw new RuntimeExecutorError(
@@ -666,11 +728,32 @@ export class RuntimeExecutor {
           `Plan summary: ${plan.summary}`,
           `Expected behavior: ${plan.expectedBehavior}`,
           `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
+          repairContext ? `Repair context:\n${repairContext}` : '',
           await this.buildWorkspaceContext(workspace.rootPath),
           'Return complete file contents for each changed file as structured edits.',
           'Only edit files required by the task. Do not modify tests or package metadata unless the task explicitly requires it.',
         ].join('\n'),
     });
+  }
+
+  private async collectDiff(workspacePath: string) {
+    const [diffResult, changedResult] = await Promise.all([
+      this.git.diff(workspacePath),
+      this.git.changedFiles(workspacePath),
+    ]);
+    return {
+      diff: diffResult.stdout,
+      changedFiles: changedResult.stdout.split('\n').map((file) => file.trim()).filter(Boolean),
+    };
+  }
+
+  private repairFailureContext(review: ReviewerResult | undefined, tests: TestExecution[], attempt: number) {
+    const failedTests = tests
+      .filter((test) => test.status !== 'PASSED')
+      .map((test) => `Command: ${test.command}\nExit: ${test.exitCode ?? 'unknown'}\nOutput: ${(test.stderr || test.stdout).slice(0, 4000)}`)
+      .join('\n\n');
+    const findings = review?.findings.map((finding) => `${finding.severity}: ${finding.message}`).join('\n') ?? '';
+    return `Repair attempt: ${attempt}\nReviewer findings:\n${findings || 'none'}\nFailed verification:\n${failedTests || 'none'}`;
   }
 
   private async buildWorkspaceContext(workspacePath: string) {
