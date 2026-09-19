@@ -15,6 +15,7 @@ import {
   TesterAgent,
   VerificationRepairLoop,
   ApprovalService,
+  type PipelineStageEvent,
   scanProject,
 } from './index.js';
 describe('scanner and mock provider', () => {
@@ -206,14 +207,110 @@ describe('scanner and mock provider', () => {
       tests: [expect.objectContaining({ status: 'PASSED' })],
     });
   });
+  it('exposes real pipeline stage boundaries and typed stage results', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pipeline-events-'));
+    const events: PipelineStageEvent[] = [];
+    await new CoreAgentPipeline().run({
+      prompt: 'Rename label',
+      metadata: {
+        language: ['TypeScript'],
+        sourceDirectories: [],
+        testDirectories: [],
+        configFiles: [],
+        testCommand: 'printf pass',
+      },
+      workspacePath: root,
+      modelOutput: JSON.stringify({
+        edits: [{ path: 'label.txt', content: 'new' }],
+        explanation: 'fixture edit',
+      }),
+      diff: '+new',
+      changedFiles: ['label.txt'],
+      onStage: (event) => {
+        events.push(event);
+      },
+    });
+
+    expect(events.map((event) => `${event.stage}:${event.status}`)).toEqual([
+      'PLANNER:STARTED',
+      'PLANNER:COMPLETED',
+      'CODER:STARTED',
+      'CODER:COMPLETED',
+      'REVIEWER:STARTED',
+      'REVIEWER:COMPLETED',
+      'TESTER:STARTED',
+      'TESTER:COMPLETED',
+    ]);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          stage: 'PLANNER',
+          status: 'COMPLETED',
+          result: expect.objectContaining({ summary: 'Rename label' }),
+        }),
+        expect.objectContaining({
+          stage: 'CODER',
+          status: 'COMPLETED',
+          result: expect.objectContaining({
+            modelOutput: expect.objectContaining({ explanation: 'fixture edit' }),
+            changedFiles: ['label.txt'],
+          }),
+        }),
+        expect.objectContaining({
+          stage: 'REVIEWER',
+          status: 'COMPLETED',
+          result: expect.objectContaining({ verdict: 'APPROVED' }),
+        }),
+        expect.objectContaining({
+          stage: 'TESTER',
+          status: 'COMPLETED',
+          result: expect.objectContaining({
+            tests: [expect.objectContaining({ command: 'printf pass', status: 'PASSED' })],
+            passed: true,
+          }),
+        }),
+      ]),
+    );
+  });
+  it('emits a failed stage boundary when model output is invalid', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'pipeline-failure-'));
+    const events: PipelineStageEvent[] = [];
+    await expect(
+      new CoreAgentPipeline().run({
+        prompt: 'Rename label',
+        metadata: {
+          language: ['TypeScript'],
+          sourceDirectories: [],
+          testDirectories: [],
+          configFiles: [],
+        },
+        workspacePath: root,
+        modelOutput: JSON.stringify({ edits: [{ path: '.env', content: 'SECRET=1' }] }),
+        diff: '+SECRET=1',
+        changedFiles: ['.env'],
+        onStage: (event) => {
+          events.push(event);
+        },
+      }),
+    ).rejects.toThrow('denied');
+    expect(events.at(-1)).toMatchObject({
+      stage: 'CODER',
+      status: 'FAILED',
+      error: expect.stringContaining('denied'),
+    });
+  });
   it('reruns real verification after repair until it passes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'repair-'));
     const loop = new VerificationRepairLoop(new TesterAgent());
+    const events: PipelineStageEvent[] = [];
     const result = await loop.run({
       workspacePath: root,
       plan: { commands: ['test -f fixed.txt'], requiresNewTests: false, rationale: 'fixture' },
       repair: async () => {
         writeFileSync(join(root, 'fixed.txt'), 'fixed');
+      },
+      onStage: (event) => {
+        events.push(event);
       },
     });
     expect(result).toMatchObject({
@@ -221,6 +318,10 @@ describe('scanner and mock provider', () => {
       repairs: 1,
       tests: [expect.objectContaining({ status: 'PASSED' })],
     });
+    expect(events.map((event) => `${event.stage}:${event.status}`)).toEqual([
+      'REPAIR:STARTED',
+      'REPAIR:COMPLETED',
+    ]);
   });
   it('produces explainable deterministic high risk and enforces approval', () => {
     const risk = new RiskEngine().assess({

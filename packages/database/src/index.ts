@@ -1,6 +1,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import {
+  agentRoleSchema,
+  agentStatusSchema,
+  type AgentRole,
+  type AgentStatus,
+  type TestRunStatus,
+} from '@codexflow/shared';
 
 export type Database = DatabaseSync;
 const now = () => new Date().toISOString();
@@ -46,6 +53,82 @@ export type DeliveryStatus =
   | 'PR_FAILED'
   | 'PR_CREATED';
 export type DeliveryAttemptStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
+export type AgentRunRecord = {
+  id: string;
+  taskId: string;
+  workspaceId?: string;
+  role: AgentRole;
+  status: AgentStatus;
+  attempt: number;
+  startedAt?: string;
+  finishedAt?: string;
+  error?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+export type PlanRecord = {
+  id: string;
+  taskId: string;
+  agentRunId?: string;
+  content: string;
+  affectedFiles: string[];
+  risks: string[];
+  createdAt: string;
+  updatedAt?: string;
+};
+export type ReviewFindingRecord = {
+  severity: 'LOW' | 'MEDIUM' | 'HIGH';
+  message: string;
+  file?: string;
+};
+export type ReviewRecord = {
+  id: string;
+  taskId: string;
+  agentRunId?: string;
+  verdict: 'APPROVED' | 'CHANGES_REQUESTED';
+  findings: ReviewFindingRecord[];
+  createdAt: string;
+  updatedAt?: string;
+};
+
+const optionalString = (value: unknown) => (value == null ? undefined : String(value));
+const mapAgentRun = (row: Record<string, unknown>): AgentRunRecord => ({
+  id: String(row.id),
+  taskId: String(row.taskId),
+  workspaceId: optionalString(row.workspaceId),
+  role: agentRoleSchema.parse(row.role),
+  status: agentStatusSchema.parse(row.status),
+  attempt: Number(row.attempt),
+  startedAt: optionalString(row.startedAt),
+  finishedAt: optionalString(row.finishedAt),
+  error: optionalString(row.error),
+  createdAt: String(row.createdAt),
+  updatedAt: String(row.updatedAt),
+});
+const mapPlan = (row: Record<string, unknown>): PlanRecord => ({
+  id: String(row.id),
+  taskId: String(row.taskId),
+  agentRunId: optionalString(row.agentRunId),
+  content: String(row.content),
+  affectedFiles: JSON.parse(String(row.affectedFiles ?? '[]')) as string[],
+  risks: JSON.parse(String(row.risks ?? '[]')) as string[],
+  createdAt: String(row.createdAt),
+  updatedAt: optionalString(row.updatedAt),
+});
+const reviewFindingSchema = z.object({
+  severity: z.enum(['LOW', 'MEDIUM', 'HIGH']),
+  message: z.string(),
+  file: z.string().optional(),
+});
+const mapReview = (row: Record<string, unknown>): ReviewRecord => ({
+  id: String(row.id),
+  taskId: String(row.taskId),
+  agentRunId: optionalString(row.agentRunId),
+  verdict: z.enum(['APPROVED', 'CHANGES_REQUESTED']).parse(row.verdict),
+  findings: z.array(reviewFindingSchema).parse(JSON.parse(String(row.findings ?? '[]'))),
+  createdAt: String(row.createdAt),
+  updatedAt: optionalString(row.updatedAt),
+});
 
 export function openDatabase(path = ':memory:'): Database {
   const db = new DatabaseSync(path);
@@ -76,6 +159,33 @@ const createRepositorySchema = z.object({
   defaultBranch: z.string().min(1),
   localPath: z.string().optional(),
 });
+const createAgentRunSchema = z.object({
+  taskId: z.string().uuid(),
+  workspaceId: z.string().uuid().optional(),
+  role: agentRoleSchema,
+  status: agentStatusSchema.default('RUNNING'),
+  attempt: z.number().int().min(1).default(1),
+  startedAt: z.string().datetime().optional(),
+});
+const updateAgentRunSchema = z.object({
+  status: agentStatusSchema,
+  finishedAt: z.string().datetime().optional(),
+  error: z.string().optional(),
+});
+const createPlanSchema = z.object({
+  taskId: z.string().uuid(),
+  agentRunId: z.string().uuid().optional(),
+  content: z.string().min(1),
+  affectedFiles: z.array(z.string()).default([]),
+  risks: z.array(z.string()).default([]),
+});
+const createReviewSchema = z.object({
+  taskId: z.string().uuid(),
+  agentRunId: z.string().uuid().optional(),
+  verdict: z.enum(['APPROVED', 'CHANGES_REQUESTED']),
+  findings: z.array(reviewFindingSchema).default([]),
+});
+const persistedTestRunStatusSchema = z.enum(['PASSED', 'FAILED']);
 export class CodexFlowStore {
   constructor(private readonly db: Database) {}
   createRepository(input: CreateRepository) {
@@ -203,43 +313,167 @@ export class CodexFlowStore {
       )
       .get(taskId) as Record<string, unknown> | undefined;
   }
-  listTaskTimeline(taskId: string) {
-    return this.db
+  createAgentRun(input: {
+    taskId: string;
+    workspaceId?: string;
+    role: AgentRole;
+    status?: AgentStatus;
+    attempt?: number;
+    startedAt?: string;
+  }) {
+    const value = createAgentRunSchema.parse(input);
+    const id = randomUUID(),
+      timestamp = now();
+    this.db
       .prepare(
-        'SELECT ar.id, ar.role, ar.status, ar.attempt, ar.started_at AS startedAt, ar.finished_at AS finishedAt FROM agent_runs ar WHERE ar.task_id = ? ORDER BY ar.created_at',
+        'INSERT INTO agent_runs (id, task_id, workspace_id, role, status, attempt, started_at, finished_at, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .all(taskId);
+      .run(
+        id,
+        value.taskId,
+        value.workspaceId ?? null,
+        value.role,
+        value.status,
+        value.attempt,
+        value.startedAt ?? (value.status === 'RUNNING' ? timestamp : null),
+        null,
+        null,
+        timestamp,
+        timestamp,
+      );
+    return this.getAgentRun(id)!;
+  }
+  updateAgentRun(
+    id: string,
+    input: {
+      status: AgentStatus;
+      finishedAt?: string;
+      error?: string;
+    },
+  ) {
+    const value = updateAgentRunSchema.parse(input);
+    const timestamp = now();
+    const finishedAt =
+      value.finishedAt ??
+      (['COMPLETED', 'FAILED', 'CANCELLED', 'TIMED_OUT'].includes(value.status)
+        ? timestamp
+        : null);
+    const result = this.db
+      .prepare(
+        'UPDATE agent_runs SET status = ?, finished_at = ?, error = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(value.status, finishedAt, value.error ?? null, timestamp, id);
+    if (result.changes !== 1) throw new Error(`Agent run not found: ${id}`);
+    return this.getAgentRun(id)!;
+  }
+  getAgentRun(id: string) {
+    const row = this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, role, status, attempt, started_at AS startedAt, finished_at AS finishedAt, error, created_at AS createdAt, updated_at AS updatedAt FROM agent_runs WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? mapAgentRun(row) : undefined;
+  }
+  listAgentRuns(taskId: string) {
+    return (this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, role, status, attempt, started_at AS startedAt, finished_at AS finishedAt, error, created_at AS createdAt, updated_at AS updatedAt FROM agent_runs WHERE task_id = ? ORDER BY created_at',
+      )
+      .all(taskId) as Record<string, unknown>[]).map(mapAgentRun);
+  }
+  listTaskTimeline(taskId: string) {
+    return this.listAgentRuns(taskId);
+  }
+  createPlan(input: {
+    taskId: string;
+    agentRunId?: string;
+    content: string;
+    affectedFiles?: string[];
+    risks?: string[];
+  }) {
+    const value = createPlanSchema.parse(input);
+    const id = randomUUID(),
+      timestamp = now();
+    this.db
+      .prepare(
+        'INSERT INTO plans (id, task_id, agent_run_id, content, affected_files, risks, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        id,
+        value.taskId,
+        value.agentRunId ?? null,
+        value.content,
+        JSON.stringify(value.affectedFiles),
+        JSON.stringify(value.risks),
+        timestamp,
+        timestamp,
+      );
+    return this.getPlan(value.taskId)!;
+  }
+  getPlan(taskId: string) {
+    const row = this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, content, affected_files AS affectedFiles, risks, created_at AS createdAt, updated_at AS updatedAt FROM plans WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+    return row ? mapPlan(row) : undefined;
   }
   listPlans(taskId: string) {
     return (this.db
       .prepare(
-        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, content, affected_files AS affectedFiles, risks, created_at AS createdAt FROM plans WHERE task_id = ? ORDER BY created_at DESC',
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, content, affected_files AS affectedFiles, risks, created_at AS createdAt, updated_at AS updatedAt FROM plans WHERE task_id = ? ORDER BY created_at DESC',
       )
-      .all(taskId) as Record<string, unknown>[]).map((row) => ({
-      ...row,
-      affectedFiles: JSON.parse(String(row.affectedFiles ?? '[]')),
-      risks: JSON.parse(String(row.risks ?? '[]')),
-    }));
+      .all(taskId) as Record<string, unknown>[]).map(mapPlan);
+  }
+  createReview(input: {
+    taskId: string;
+    agentRunId?: string;
+    verdict: 'APPROVED' | 'CHANGES_REQUESTED';
+    findings?: ReviewFindingRecord[];
+  }) {
+    const value = createReviewSchema.parse(input);
+    const id = randomUUID(),
+      timestamp = now();
+    this.db
+      .prepare(
+        'INSERT INTO reviews (id, task_id, agent_run_id, verdict, findings, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        id,
+        value.taskId,
+        value.agentRunId ?? null,
+        value.verdict,
+        JSON.stringify(value.findings),
+        timestamp,
+        timestamp,
+      );
+    return this.getReview(value.taskId)!;
+  }
+  getReview(taskId: string) {
+    const row = this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, verdict, findings, created_at AS createdAt, updated_at AS updatedAt FROM reviews WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+    return row ? mapReview(row) : undefined;
   }
   listReviews(taskId: string) {
     return (this.db
       .prepare(
-        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, verdict, findings, created_at AS createdAt FROM reviews WHERE task_id = ? ORDER BY created_at DESC',
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, verdict, findings, created_at AS createdAt, updated_at AS updatedAt FROM reviews WHERE task_id = ? ORDER BY created_at DESC',
       )
-      .all(taskId) as Record<string, unknown>[]).map((row) => ({
-      ...row,
-      findings: JSON.parse(String(row.findings ?? '[]')),
-    }));
+      .all(taskId) as Record<string, unknown>[]).map(mapReview);
   }
   recordTestRun(input: {
     taskId: string;
     command: string;
-    status: 'PASSED' | 'FAILED';
+    status: Extract<TestRunStatus, 'PASSED' | 'FAILED'>;
     exitCode: number | null;
     stdout: string;
     stderr: string;
     durationMs: number;
   }) {
+    persistedTestRunStatusSchema.parse(input.status);
     const id = randomUUID(),
       timestamp = now();
     this.db

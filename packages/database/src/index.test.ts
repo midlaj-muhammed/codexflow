@@ -88,4 +88,84 @@ describe('CodexFlowStore', () => {
     expect(store.listTasks()).toHaveLength(1);
     expect(store.getWorkspaceForTask(String(task.id))).toMatchObject({ branch: 'codexflow/task-ui' });
   });
+  it('persists agent runs, plans, reviews, and real test runs through public contracts', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const repository = store.createRepository({
+      provider: 'github',
+      owner: 'acme',
+      name: 'runtime-contracts',
+      url: 'https://github.com/acme/runtime-contracts',
+      defaultBranch: 'main',
+    });
+    const project = store.createProject(String(repository.id), 'Runtime contracts');
+    const task = store.createTask(project.id, 'Expose runtime persistence contracts');
+    const workspace = store.createWorkspace(
+      String(task.id),
+      '/tmp/runtime-contracts/task',
+      'codexflow/task-runtime',
+      'base-sha',
+    );
+
+    const run = store.createAgentRun({
+      taskId: String(task.id),
+      workspaceId: workspace.id,
+      role: 'PLANNER',
+      attempt: 1,
+    });
+    expect(run).toMatchObject({
+      taskId: task.id,
+      workspaceId: workspace.id,
+      role: 'PLANNER',
+      status: 'RUNNING',
+      attempt: 1,
+    });
+
+    const completed = store.updateAgentRun(run.id, { status: 'COMPLETED' });
+    expect(completed).toMatchObject({ id: run.id, status: 'COMPLETED' });
+    expect(completed.finishedAt).toBeTruthy();
+    expect(store.getAgentRun(run.id)).toMatchObject({ id: run.id, status: 'COMPLETED' });
+    expect(store.listAgentRuns(String(task.id))).toHaveLength(1);
+    expect(store.listTaskTimeline(String(task.id))[0]).toMatchObject({ role: 'PLANNER' });
+
+    const plan = store.createPlan({
+      taskId: String(task.id),
+      agentRunId: run.id,
+      content: 'Plan the change',
+      affectedFiles: ['src/message.txt'],
+      risks: ['low-risk text update'],
+    });
+    expect(store.getPlan(String(task.id))).toMatchObject({
+      id: plan.id,
+      affectedFiles: ['src/message.txt'],
+      risks: ['low-risk text update'],
+    });
+    expect(store.listPlans(String(task.id))).toHaveLength(1);
+
+    const review = store.createReview({
+      taskId: String(task.id),
+      agentRunId: run.id,
+      verdict: 'APPROVED',
+      findings: [{ severity: 'LOW', message: 'Looks safe', file: 'src/message.txt' }],
+    });
+    expect(store.getReview(String(task.id))).toMatchObject({
+      id: review.id,
+      verdict: 'APPROVED',
+      findings: [expect.objectContaining({ message: 'Looks safe' })],
+    });
+    expect(store.listReviews(String(task.id))).toHaveLength(1);
+
+    const testRunId = store.recordTestRun({
+      taskId: String(task.id),
+      command: 'printf ok',
+      status: 'PASSED',
+      exitCode: 0,
+      stdout: 'ok',
+      stderr: '',
+      durationMs: 5,
+    });
+    expect(testRunId).toBeTruthy();
+    expect(store.listTestRuns(String(task.id))).toEqual([
+      expect.objectContaining({ command: 'printf ok', status: 'PASSED', exitCode: 0 }),
+    ]);
+  });
 });

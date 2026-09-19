@@ -301,11 +301,12 @@ export class PlannerAgent {
   }
 }
 export type ReviewFinding = { severity: 'LOW' | 'MEDIUM' | 'HIGH'; message: string; file?: string };
+export type ReviewerResult = {
+  verdict: 'APPROVED' | 'CHANGES_REQUESTED';
+  findings: ReviewFinding[];
+};
 export class ReviewerAgent {
-  review(input: { changedFiles: string[]; diff: string }): {
-    verdict: 'APPROVED' | 'CHANGES_REQUESTED';
-    findings: ReviewFinding[];
-  } {
+  review(input: { changedFiles: string[]; diff: string }): ReviewerResult {
     const findings: ReviewFinding[] = [];
     if (/\.env|credentials|\.pem|\.key/i.test(`${input.changedFiles.join('\n')}\n${input.diff}`))
       findings.push({ severity: 'HIGH', message: 'Sensitive file appears in the diff.' });
@@ -320,8 +321,9 @@ export class ReviewerAgent {
   }
 }
 export type FileEdit = { path: string; content: string };
+export type CoderResult = { changedFiles: string[] };
 export class CoderAgent {
-  async applyEdits(workspacePath: string, edits: FileEdit[]) {
+  async applyEdits(workspacePath: string, edits: FileEdit[]): Promise<CoderResult> {
     for (const edit of edits) {
       const target = resolve(workspacePath, edit.path);
       if (
@@ -352,6 +354,34 @@ export class SupervisorAgent {
     return attempt < this.maxRepairs ? 'REPAIRING' : 'BLOCKED';
   }
 }
+export type PipelineStage = 'PLANNER' | 'CODER' | 'REVIEWER' | 'TESTER' | 'REPAIR';
+export type CoderStageResult = {
+  modelOutput: CoderModelOutput;
+  appliedEdits: FileEdit[];
+  changedFiles: string[];
+};
+export type TesterStageResult = {
+  tests: TestExecution[];
+  passed: boolean;
+};
+export type RepairStageResult = {
+  attempt: number;
+};
+export type PipelineStageResult =
+  | PlannerResult
+  | CoderStageResult
+  | ReviewerResult
+  | TesterStageResult
+  | RepairStageResult;
+export type PipelineStageEvent =
+  | { stage: PipelineStage; status: 'STARTED'; at: string }
+  | { stage: PipelineStage; status: 'COMPLETED'; at: string; result: PipelineStageResult }
+  | { stage: PipelineStage; status: 'FAILED'; at: string; error: string };
+type PendingPipelineStageEvent =
+  | { stage: PipelineStage; status: 'STARTED' }
+  | { stage: PipelineStage; status: 'COMPLETED'; result: PipelineStageResult }
+  | { stage: PipelineStage; status: 'FAILED'; error: string };
+export type PipelineStageObserver = (event: PipelineStageEvent) => Promise<void> | void;
 export class CoreAgentPipeline {
   constructor(
     private readonly planner = new PlannerAgent(),
@@ -368,18 +398,53 @@ export class CoreAgentPipeline {
     diff: string;
     changedFiles: string[];
     attempt?: number;
+    onStage?: PipelineStageObserver;
   }) {
-    const plan = this.planner.plan({ prompt: input.prompt, metadata: input.metadata });
-    const code = await this.coder.applyModelOutput(input.workspacePath, input.modelOutput);
-    const review = this.reviewer.review({
-      changedFiles: input.changedFiles.length ? input.changedFiles : code.changedFiles,
-      diff: input.diff,
+    const emit = (event: PendingPipelineStageEvent) =>
+      input.onStage?.({ ...event, at: new Date().toISOString() } as PipelineStageEvent);
+    const runStage = async <T extends PipelineStageResult>(
+      stage: PipelineStage,
+      operation: () => Promise<T> | T,
+    ) => {
+      await emit({ stage, status: 'STARTED' });
+      try {
+        const result = await operation();
+        await emit({ stage, status: 'COMPLETED', result });
+        return result;
+      } catch (error) {
+        await emit({
+          stage,
+          status: 'FAILED',
+          error: error instanceof Error ? error.message : `${stage} stage failed`,
+        });
+        throw error;
+      }
+    };
+    const plan = await runStage('PLANNER', () =>
+      this.planner.plan({ prompt: input.prompt, metadata: input.metadata }),
+    );
+    const codeStage = await runStage('CODER', async () => {
+      const modelOutput = coderModelOutputSchema.parse(JSON.parse(input.modelOutput));
+      const code = await this.coder.applyEdits(input.workspacePath, modelOutput.edits);
+      return { modelOutput, appliedEdits: modelOutput.edits, changedFiles: code.changedFiles };
     });
-    const tests = await this.tester.verify(input.workspacePath, plan.verification);
+    const review = await runStage('REVIEWER', () =>
+      this.reviewer.review({
+        changedFiles: input.changedFiles.length ? input.changedFiles : codeStage.changedFiles,
+        diff: input.diff,
+      }),
+    );
+    const testStage = await runStage('TESTER', async () => {
+      const tests = await this.tester.verify(input.workspacePath, plan.verification);
+      return { tests, passed: tests.every((test) => test.status === 'PASSED') };
+    });
+    const tests = testStage.tests;
     const passed = review.verdict === 'APPROVED' && tests.every((test) => test.status === 'PASSED');
     return {
       plan,
-      code,
+      code: {
+        changedFiles: codeStage.changedFiles,
+      },
       review,
       tests,
       next: this.supervisor.nextAfterVerification(input.attempt ?? 1, passed),
@@ -395,14 +460,28 @@ export class VerificationRepairLoop {
     workspacePath: string;
     plan: VerificationPlan;
     repair: (attempt: number) => Promise<void>;
+    onStage?: PipelineStageObserver;
   }) {
+    const emit = (event: PendingPipelineStageEvent) =>
+      input.onStage?.({ ...event, at: new Date().toISOString() } as PipelineStageEvent);
     let tests = await this.tester.verify(input.workspacePath, input.plan);
     for (
       let attempt = 1;
       !tests.every((test) => test.status === 'PASSED') && attempt <= this.maxRepairs;
       attempt += 1
     ) {
-      await input.repair(attempt);
+      await emit({ stage: 'REPAIR', status: 'STARTED' });
+      try {
+        await input.repair(attempt);
+        await emit({ stage: 'REPAIR', status: 'COMPLETED', result: { attempt } });
+      } catch (error) {
+        await emit({
+          stage: 'REPAIR',
+          status: 'FAILED',
+          error: error instanceof Error ? error.message : 'REPAIR stage failed',
+        });
+        throw error;
+      }
       tests = await this.tester.verify(input.workspacePath, input.plan);
       if (tests.every((test) => test.status === 'PASSED'))
         return { status: 'PASSED' as const, tests, repairs: attempt };

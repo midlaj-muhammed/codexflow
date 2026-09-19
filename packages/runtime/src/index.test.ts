@@ -33,6 +33,36 @@ describe('runtime', () => {
     expect(lifecycle.get('x')).toBe('QUEUED');
     expect(observed).toEqual(['task.created', 'task.started']);
   });
+  it('delivers reusable agent boundary events for future runtime stage observers', async () => {
+    const observed: string[] = [];
+    const events = new EventBus();
+    events.subscribe((event) => {
+      observed.push(`${event.type}:${event.payload?.role ?? 'none'}`);
+    });
+    await events.emit({
+      type: 'agent.started',
+      taskId: 'x',
+      at: new Date().toISOString(),
+      payload: { role: 'PLANNER' },
+    });
+    await events.emit({
+      type: 'agent.completed',
+      taskId: 'x',
+      at: new Date().toISOString(),
+      payload: { role: 'PLANNER', status: 'COMPLETED' },
+    });
+    await events.emit({
+      type: 'agent.failed',
+      taskId: 'x',
+      at: new Date().toISOString(),
+      payload: { role: 'CODER', error: 'invalid structured output' },
+    });
+    expect(observed).toEqual([
+      'agent.started:PLANNER',
+      'agent.completed:PLANNER',
+      'agent.failed:CODER',
+    ]);
+  });
   it('rejects invalid transitions', async () => {
     const lifecycle = new TaskLifecycleManager();
     await lifecycle.create('x');
