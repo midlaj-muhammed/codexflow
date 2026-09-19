@@ -10,9 +10,16 @@ export class GitError extends Error {
   }
 }
 export class GitEngine {
+  constructor(private readonly timeoutMs = 60_000) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Git timeout must be positive');
+  }
   private async run(cwd: string, args: string[]) {
     try {
-      const { stdout, stderr } = await exec('git', args, { cwd, maxBuffer: 10_000_000 });
+      const { stdout, stderr } = await exec('git', args, {
+        cwd,
+        maxBuffer: 10_000_000,
+        timeout: this.timeoutMs,
+      });
       return { stdout: stdout.trim(), stderr: stderr.trim() };
     } catch (error) {
       const result = error as { stderr?: string; message: string };

@@ -6,9 +6,9 @@ import { join } from 'node:path';
 import { openDatabase, CodexFlowStore } from '@codexflow/database';
 import { ApprovalService, CoreAgentPipeline, RiskEngine, TesterAgent } from '@codexflow/agents';
 import { GitEngine } from '@codexflow/git';
-import type { GitProvider, RemotePullRequest } from '@codexflow/providers';
+import { ProviderError, type GitProvider, type RemotePullRequest } from '@codexflow/providers';
 import { EventBus, TaskLifecycleManager } from '@codexflow/runtime';
-import { DeliveryService, type DeliveryRecord } from './index.js';
+import { classifyDeliveryFailure, DeliveryService, type DeliveryRecord } from './index.js';
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync('git', args, { cwd }).toString().trim();
@@ -182,8 +182,15 @@ describe('DeliveryService durable delivery', () => {
       path,
       baseline,
     });
+    const firstApprovals = new ApprovalService(firstStore.store);
+    firstApprovals.request(firstRecord.taskId, firstRecord.workspaceId, firstRecord.diff, {
+      level: 'HIGH',
+      score: 60,
+      reasons: ['auth'],
+    });
+    firstApprovals.approve(firstRecord.taskId, 'human', firstRecord.diff);
     const first = await service({
-      approvals: approvalsFor(firstRecord.taskId, firstRecord.workspaceId, firstRecord.diff),
+      approvals: firstApprovals,
       store: firstStore.store,
     }).commit(firstRecord);
     firstStore.db.close();
@@ -197,14 +204,27 @@ describe('DeliveryService durable delivery', () => {
       baseline,
     });
     const second = await service({
-      approvals: approvalsFor(secondRecord.taskId, secondRecord.workspaceId, secondRecord.diff),
+      approvals: new ApprovalService(secondStore),
       store: secondStore,
     }).commit(secondRecord);
 
     expect(second.sha).toBe(first.sha);
     expect(secondStore.findDeliveryCommit(secondRecord.taskId, approvalsFor(secondRecord.taskId, secondRecord.workspaceId, secondRecord.diff).fingerprint(secondRecord.diff))?.sha).toBe(first.sha);
     expect(secondStore.getTask(secondRecord.taskId)?.deliveryStatus).toBe('COMMITTED');
+    expect(secondStore.listTestRuns(secondRecord.taskId)).toEqual([
+      expect.objectContaining({ command: 'test -f a.txt', status: 'PASSED' }),
+    ]);
     secondDb.close();
+  });
+
+  it('classifies approval blocks, transient providers, and invalid provider configuration', () => {
+    expect(classifyDeliveryFailure(new Error('High-risk task requires explicit human approval'))).toBe(
+      'BLOCKED',
+    );
+    expect(classifyDeliveryFailure(new ProviderError('UNAVAILABLE', 'offline'))).toBe('RETRYABLE');
+    expect(classifyDeliveryFailure(new ProviderError('VALIDATION', 'bad repository'))).toBe(
+      'PERMANENT_FAILURE',
+    );
   });
 
   it('pushes to a real bare remote and persists PUSHED state', async () => {
@@ -431,9 +451,11 @@ describe('DeliveryService durable delivery', () => {
     const { db, store, task } = createStore();
     const workspace = workspaceStore(store, String(task.id), path, baseline);
     const delivery = record({ taskId: String(task.id), workspaceId: workspace.id, path, baseline });
-    const observed: string[] = [];
+    const observed: Array<{ type: string; payload?: Record<string, unknown> }> = [];
     const lifecycle = new TaskLifecycleManager({
-      saveTaskState: () => {},
+      saveTaskState: (taskId, status) => {
+        store.transitionTask(taskId, status);
+      },
       saveDeliveryState: (taskId, status, error) => {
         store.setTaskDeliveryStatus(taskId, status, error);
       },
@@ -442,12 +464,24 @@ describe('DeliveryService durable delivery', () => {
     const events = new EventBus({
       saveTaskState: () => {},
       appendEvent: (event) => {
-        observed.push(event.type);
+        observed.push(event);
       },
     });
     events.subscribe((event) => {
-      observed.push(event.type);
+      observed.push(event);
     });
+    await lifecycle.create(delivery.taskId);
+    for (const status of [
+      'QUEUED',
+      'PLANNING',
+      'CONTEXT_READY',
+      'CODING',
+      'REVIEWING',
+      'TESTING',
+      'READY_FOR_APPROVAL',
+      'APPROVED',
+    ] as const)
+      await lifecycle.transition(delivery.taskId, status);
     const pullRequest = await new DeliveryService(
       new GitEngine(),
       approvalsFor(delivery.taskId, delivery.workspaceId, delivery.diff),
@@ -467,7 +501,8 @@ describe('DeliveryService durable delivery', () => {
       'test -f a.txt: PASSED',
     );
     expect(store.getTask(delivery.taskId)?.deliveryStatus).toBe('PR_CREATED');
-    expect(observed).toEqual(
+    expect(store.getTask(delivery.taskId)?.status).toBe('APPROVED');
+    expect(observed.map((event) => event.type)).toEqual(
       expect.arrayContaining([
         'delivery.started',
         'commit.completed',
@@ -476,6 +511,15 @@ describe('DeliveryService durable delivery', () => {
         'delivery.completed',
       ]),
     );
+    expect(observed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'commit.completed',
+          payload: expect.objectContaining({ workspaceId: workspace.id, branch: delivery.branch }),
+        }),
+      ]),
+    );
+    expect(JSON.stringify(observed)).not.toContain('top-secret');
     db.close();
   });
 });

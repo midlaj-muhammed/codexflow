@@ -5,9 +5,9 @@ import {
   type TesterAgent,
   type VerificationPlan,
 } from '@codexflow/agents';
-import { GitEngine } from '@codexflow/git';
+import { GitEngine, GitError } from '@codexflow/git';
 import type { CodexFlowStore, DeliveryStatus } from '@codexflow/database';
-import type { GitProvider, RemotePullRequest } from '@codexflow/providers';
+import { ProviderError, type GitProvider, type RemotePullRequest } from '@codexflow/providers';
 import type { EventBus, TaskLifecycleManager } from '@codexflow/runtime';
 export type CommitMetadata = { subject: string; body?: string };
 export type PullRequestMetadata = { title: string; body: string };
@@ -34,6 +34,18 @@ export type DeliveryRuntime = {
   lifecycle: Pick<TaskLifecycleManager, 'recordDeliveryState'>;
   events: Pick<EventBus, 'emit'>;
 };
+export type DeliveryFailureClassification = 'BLOCKED' | 'RETRYABLE' | 'PERMANENT_FAILURE';
+export function classifyDeliveryFailure(error: unknown): DeliveryFailureClassification {
+  if (error instanceof ProviderError)
+    return error.code === 'UNAVAILABLE' || error.code === 'UNKNOWN'
+      ? 'RETRYABLE'
+      : 'PERMANENT_FAILURE';
+  if (error instanceof GitError) return 'RETRYABLE';
+  const message = error instanceof Error ? error.message : '';
+  if (/approval|sensitive|protected|verification|workspace branch|baseline|delivery SHA/i.test(message))
+    return 'BLOCKED';
+  return 'PERMANENT_FAILURE';
+}
 const sensitive = /(^|\/)(\.env(?:\..*)?|credentials\.json|secrets\.|.*\.(pem|key))$/i;
 export class Reporter {
   commit(input: DeliveryRecord): CommitMetadata {
@@ -85,18 +97,11 @@ export class DeliveryService {
       type,
       taskId: record.taskId,
       at: new Date().toISOString(),
-      payload,
+      payload: { workspaceId: record.workspaceId, branch: record.branch, ...payload },
     });
   }
   private async assertSafe(record: DeliveryRecord) {
-    try {
-      return this.assertSafeInner(record);
-    } catch (error) {
-      await this.emit(record, 'delivery.blocked', {
-        reason: error instanceof Error ? error.message : 'Delivery blocked',
-      });
-      throw error;
-    }
+    return this.assertSafeInner(record);
   }
   private assertSafeInner(record: DeliveryRecord) {
     if (this.protectedBranches.includes(record.branch))
@@ -247,6 +252,7 @@ export class DeliveryService {
     } catch (error) {
       await this.emit(record, 'commit.failed', {
         reason: error instanceof Error ? error.message : 'Commit failed',
+        classification: classifyDeliveryFailure(error),
       });
       throw error;
     }
@@ -282,13 +288,13 @@ export class DeliveryService {
       const message = error instanceof Error ? error.message : 'Push failed';
       if (attemptId) this.store?.updateDeliveryPush(attemptId, 'FAILED', message);
       await this.mark(record, 'PUSH_FAILED', message);
-      await this.emit(record, 'push.failed', { reason: message });
       throw error;
     }
     } catch (error) {
       if (!(error instanceof Error) || error.message !== 'Push failed')
         await this.emit(record, 'push.failed', {
           reason: error instanceof Error ? error.message : 'Push failed',
+          classification: classifyDeliveryFailure(error),
         });
       throw error;
     }
@@ -386,13 +392,13 @@ export class DeliveryService {
       const message = error instanceof Error ? error.message : 'Pull request creation failed';
       if (attemptId) this.store?.updateDeliveryPullRequest(attemptId, { status: 'FAILED', error: message });
       await this.mark(record, 'PR_FAILED', message);
-      await this.emit(record, 'pr.failed', { reason: message });
       throw error;
     }
     } catch (error) {
       if (!(error instanceof Error) || error.message !== 'Pull request creation failed')
         await this.emit(record, 'pr.failed', {
           reason: error instanceof Error ? error.message : 'Pull request creation failed',
+          classification: classifyDeliveryFailure(error),
         });
       throw error;
     }
@@ -408,6 +414,7 @@ export class DeliveryService {
     } catch (error) {
       await this.emit(record, 'delivery.blocked', {
         reason: error instanceof Error ? error.message : 'Delivery failed',
+        classification: classifyDeliveryFailure(error),
       });
       throw error;
     }

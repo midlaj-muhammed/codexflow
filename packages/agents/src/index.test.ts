@@ -89,6 +89,37 @@ describe('scanner and mock provider', () => {
     });
     expect(calls).toEqual(['create', 'event', 'event', 'finish']);
   });
+  it('cancels and records a timed out agent run', async () => {
+    let cancelled = false;
+    const provider = {
+      run: async () => new Promise<never>(() => {}),
+      cancel: async () => {
+        cancelled = true;
+      },
+      async *stream() {},
+    };
+    const finishes: string[] = [];
+    const runner = new AgentRunner(provider, {
+      createRun: () => {},
+      appendEvent: () => {},
+      finishRun: (_runId, status) => {
+        finishes.push(status);
+      },
+    });
+    await expect(
+      runner.run({
+        runId: 'slow',
+        taskId: 't',
+        workspacePath: '/tmp',
+        role: 'PLANNER',
+        prompt: 'Plan',
+        attempt: 1,
+        timeoutMs: 1,
+      }),
+    ).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(cancelled).toBe(true);
+    expect(finishes).toEqual(['FAILED']);
+  });
   it('creates a task-specific verification strategy without inventing tests for normal work', () => {
     const planner = new PlannerAgent();
     const normal = planner.plan({
@@ -213,5 +244,19 @@ describe('scanner and mock provider', () => {
     approvals.request('t', 'w', 'before', { level: 'HIGH', score: 80, reasons: ['x'] });
     approvals.approve('t', 'human', 'before');
     expect(() => approvals.assertMayApply('t', 'after')).toThrow('EXPIRED');
+  });
+  it('hydrates a fingerprint-bound approval from persistence after restart', () => {
+    const saved = new Map();
+    const persistence = {
+      saveApproval: (approval: { taskId: string }) => {
+        saved.set(approval.taskId, structuredClone(approval));
+      },
+      loadApproval: (taskId: string) => saved.get(taskId),
+    };
+    const first = new ApprovalService(persistence);
+    first.request('t', 'w', 'diff', { level: 'HIGH', score: 80, reasons: ['x'] });
+    first.approve('t', 'human', 'diff');
+    const restarted = new ApprovalService(persistence);
+    expect(restarted.assertMayApply('t', 'diff')).toMatchObject({ state: 'APPROVED' });
   });
 });

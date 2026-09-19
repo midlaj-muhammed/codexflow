@@ -77,8 +77,11 @@ export class GitHubProvider implements GitProvider {
   constructor(
     private readonly token: string,
     private readonly fetcher: typeof fetch = fetch,
+    private readonly timeoutMs = 30_000,
   ) {
     if (!token.trim()) throw new ProviderError('AUTH_FAILED', 'GitHub token is required');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+      throw new ProviderError('VALIDATION', 'GitHub timeout must be positive');
   }
   private async request(path: string, init?: RequestInit) {
     let response: Response;
@@ -91,6 +94,7 @@ export class GitHubProvider implements GitProvider {
           'X-GitHub-Api-Version': '2022-11-28',
           ...init?.headers,
         },
+        signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
       });
     } catch {
       throw new ProviderError('UNAVAILABLE', 'GitHub is unavailable');

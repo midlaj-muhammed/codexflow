@@ -211,11 +211,20 @@ export class AgentRunner {
       role: input.role,
       attempt: input.attempt,
     });
-    const timeout = input.timeoutMs
-      ? setTimeout(() => void this.provider.cancel(input.runId), input.timeoutMs)
-      : undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
-      const result = await this.provider.run(input);
+      const run = this.provider.run(input);
+      const result = input.timeoutMs
+        ? await Promise.race([
+            run,
+            new Promise<AgentRunResult>((_resolve, reject) => {
+              timeout = setTimeout(() => {
+                void this.provider.cancel(input.runId);
+                reject(new AgentProviderError('TIMEOUT', `Agent run timed out after ${input.timeoutMs}ms`));
+              }, input.timeoutMs);
+            }),
+          ])
+        : await run;
       for (const event of result.events) await this.persistence?.appendEvent(input.runId, event);
       await this.persistence?.finishRun(input.runId, 'COMPLETED');
       return result;
@@ -463,8 +472,13 @@ export type Approval = {
   approvedBy?: string;
   approvedAt?: string;
 };
+export type ApprovalPersistence = {
+  saveApproval(approval: Approval): void;
+  loadApproval(taskId: string): Approval | undefined;
+};
 export class ApprovalService {
   private approvals = new Map<string, Approval>();
+  constructor(private readonly persistence?: ApprovalPersistence) {}
   fingerprint(diff: string) {
     return createHash('sha256').update(diff).digest('hex');
   }
@@ -477,6 +491,7 @@ export class ApprovalService {
       state: 'PENDING',
     };
     this.approvals.set(taskId, approval);
+    this.save(approval);
     return approval;
   }
   approve(taskId: string, actor: string, diff: string) {
@@ -486,17 +501,21 @@ export class ApprovalService {
     approval.state = 'APPROVED';
     approval.approvedBy = actor;
     approval.approvedAt = new Date().toISOString();
+    this.save(approval);
     return approval;
   }
   reject(taskId: string) {
     const approval = this.require(taskId);
     approval.state = 'REJECTED';
+    this.save(approval);
     return approval;
   }
   invalidateIfChanged(taskId: string, diff: string) {
     const approval = this.require(taskId);
-    if (approval.fingerprint !== this.fingerprint(diff) && approval.state === 'APPROVED')
+    if (approval.fingerprint !== this.fingerprint(diff) && approval.state === 'APPROVED') {
       approval.state = 'EXPIRED';
+      this.save(approval);
+    }
     return approval;
   }
   assertMayApply(taskId: string, diff: string) {
@@ -512,9 +531,17 @@ export class ApprovalService {
     return approval;
   }
   private require(taskId: string) {
-    const approval = this.approvals.get(taskId);
+    const approval = this.approvals.get(taskId) ?? this.load(taskId);
     if (!approval) throw new Error(`No approval for task: ${taskId}`);
     return approval;
+  }
+  private save(approval: Approval) {
+    this.persistence?.saveApproval(approval);
+  }
+  private load(taskId: string) {
+    const result = this.persistence?.loadApproval(taskId);
+    if (result) this.approvals.set(taskId, result);
+    return result;
   }
 }
 export type TestExecution = {
@@ -529,6 +556,9 @@ const runProcess = promisify(execFile);
 const prohibited =
   /(^|\s)(sudo|rm\s+-rf|git\s+reset\s+--hard|git\s+clean\s+-fd|curl|wget|npm\s+install|pnpm\s+add)(\s|$)|[;&|`]/;
 export class TesterAgent {
+  constructor(private readonly timeoutMs = 60_000) {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Tester timeout must be positive');
+  }
   async verify(workspacePath: string, plan: VerificationPlan): Promise<TestExecution[]> {
     return Promise.all(plan.commands.map((command) => this.execute(workspacePath, command)));
   }
@@ -539,6 +569,7 @@ export class TesterAgent {
       const { stdout, stderr } = await runProcess('sh', ['-lc', command], {
         cwd,
         maxBuffer: 10_000_000,
+        timeout: this.timeoutMs,
       });
       return {
         command,

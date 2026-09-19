@@ -31,7 +31,34 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 3,
+      count: 4,
+    });
+  });
+  it('persists fingerprint-bound approvals through the existing approvals table', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const repository = store.createRepository({
+      provider: 'github',
+      owner: 'acme',
+      name: 'approval-fixture',
+      url: 'https://github.com/acme/approval-fixture',
+      defaultBranch: 'main',
+    });
+    const project = store.createProject(String(repository.id), 'Approval fixture');
+    const task = store.createTask(project.id, 'Persist approval');
+    store.saveApproval({
+      taskId: String(task.id),
+      workspaceId: 'workspace-1',
+      fingerprint: 'fingerprint',
+      risk: { level: 'HIGH', score: 70, reasons: ['fixture'] },
+      state: 'APPROVED',
+      approvedBy: 'human',
+      approvedAt: '2026-01-01T00:00:00.000Z',
+    });
+    expect(store.loadApproval(String(task.id))).toMatchObject({
+      workspaceId: 'workspace-1',
+      fingerprint: 'fingerprint',
+      state: 'APPROVED',
+      risk: { level: 'HIGH' },
     });
   });
   it('validates repository input and prevents empty task prompts', () => {

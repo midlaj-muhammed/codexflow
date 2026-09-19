@@ -30,6 +30,12 @@ const migrations = [
    CREATE INDEX IF NOT EXISTS delivery_pushes_task_commit ON delivery_pushes(task_id, commit_sha);
    CREATE INDEX IF NOT EXISTS delivery_pull_requests_task_commit ON delivery_pull_requests(task_id, commit_sha);
    CREATE UNIQUE INDEX IF NOT EXISTS delivery_pull_requests_success ON delivery_pull_requests(task_id, branch, commit_sha) WHERE status = 'SUCCEEDED';`,
+  `ALTER TABLE approvals ADD COLUMN workspace_id TEXT;
+   ALTER TABLE approvals ADD COLUMN fingerprint TEXT;
+   ALTER TABLE approvals ADD COLUMN risk TEXT;
+   ALTER TABLE approvals ADD COLUMN state TEXT;
+   ALTER TABLE approvals ADD COLUMN approved_at TEXT;
+   CREATE INDEX IF NOT EXISTS approvals_task_created ON approvals(task_id, created_at DESC);`,
 ];
 
 export type DeliveryStatus =
@@ -198,6 +204,89 @@ export class CodexFlowStore {
         'SELECT id, task_id AS taskId, command, status, exit_code AS exitCode, stdout, stderr, duration_ms AS durationMs, created_at AS createdAt FROM test_runs WHERE task_id = ? ORDER BY created_at ASC',
       )
       .all(taskId) as Record<string, unknown>[];
+  }
+  saveApproval(input: {
+    taskId: string;
+    workspaceId: string;
+    fingerprint: string;
+    risk: { level: string; score: number; reasons: string[] };
+    state: string;
+    approvedBy?: string;
+    approvedAt?: string;
+  }) {
+    const existing = this.db
+      .prepare('SELECT id, created_at AS createdAt FROM approvals WHERE task_id = ? ORDER BY created_at DESC LIMIT 1')
+      .get(input.taskId) as { id: string; createdAt: string } | undefined;
+    const timestamp = now();
+    if (existing) {
+      this.db
+        .prepare(
+          'UPDATE approvals SET decision = ?, approved_by = ?, approved_at = ?, updated_at = ?, workspace_id = ?, fingerprint = ?, risk = ?, state = ? WHERE id = ?',
+        )
+        .run(
+          input.state,
+          input.approvedBy ?? null,
+          input.approvedAt ?? null,
+          timestamp,
+          input.workspaceId,
+          input.fingerprint,
+          JSON.stringify(input.risk),
+          input.state,
+          existing.id,
+        );
+    } else {
+      this.db
+        .prepare(
+          'INSERT INTO approvals (id, task_id, decision, approved_by, note, created_at, updated_at, workspace_id, fingerprint, risk, state, approved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          randomUUID(),
+          input.taskId,
+          input.state,
+          input.approvedBy ?? null,
+          null,
+          timestamp,
+          timestamp,
+          input.workspaceId,
+          input.fingerprint,
+          JSON.stringify(input.risk),
+          input.state,
+          input.approvedAt ?? null,
+        );
+    }
+  }
+  loadApproval(taskId: string):
+    | {
+        taskId: string;
+        workspaceId: string;
+        fingerprint: string;
+        risk: { level: 'LOW' | 'MEDIUM' | 'HIGH'; score: number; reasons: string[] };
+        state: 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CANCELLED';
+        approvedBy?: string;
+        approvedAt?: string;
+      }
+    | undefined {
+    const row = this.db
+      .prepare(
+        'SELECT task_id AS taskId, workspace_id AS workspaceId, fingerprint, risk, state, decision, approved_by AS approvedBy, approved_at AS approvedAt FROM approvals WHERE task_id = ? ORDER BY updated_at DESC LIMIT 1',
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+    if (!row || !row.workspaceId || !row.fingerprint || !row.risk) return undefined;
+    const risk = z
+      .object({ level: z.enum(['LOW', 'MEDIUM', 'HIGH']), score: z.number(), reasons: z.array(z.string()) })
+      .parse(JSON.parse(String(row.risk)));
+    const state = z
+      .enum(['PENDING', 'APPROVED', 'REJECTED', 'EXPIRED', 'CANCELLED'])
+      .parse(row.state ?? row.decision);
+    return {
+      taskId: String(row.taskId),
+      workspaceId: String(row.workspaceId),
+      fingerprint: String(row.fingerprint),
+      risk,
+      state,
+      approvedBy: row.approvedBy ? String(row.approvedBy) : undefined,
+      approvedAt: row.approvedAt ? String(row.approvedAt) : undefined,
+    };
   }
   createDeliveryCommit(input: {
     taskId: string;

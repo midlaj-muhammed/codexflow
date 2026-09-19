@@ -34,6 +34,17 @@ describe('GitHubProvider', () => {
       }).listRepositories(),
     ).rejects.toMatchObject({ code: 'UNAVAILABLE' });
   });
+  it('bounds a stalled provider request with the configured timeout', async () => {
+    const provider = new GitHubProvider(
+      'token',
+      async (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        }),
+      1,
+    );
+    await expect(provider.listRepositories()).rejects.toMatchObject({ code: 'UNAVAILABLE' });
+  });
   it('creates, discovers, and retrieves pull requests with provider head evidence', async () => {
     const pull = {
       id: 7,

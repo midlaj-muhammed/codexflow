@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { GitEngine } from './index.js';
 
 describe('GitEngine', () => {
+  it('requires an explicit positive command timeout', () => {
+    expect(() => new GitEngine(0)).toThrow('timeout');
+  });
   it('inspects a repository without mutating it', async () => {
     const path = mkdtempSync(join(tmpdir(), 'codexflow-engine-'));
     const run = (...args: string[]) => execFileSync('git', args, { cwd: path });
