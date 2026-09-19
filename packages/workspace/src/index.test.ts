@@ -41,4 +41,15 @@ describe('WorkspaceManager', () => {
       manager.createWorkspace({ repositoryPath: repo.path, taskId: 'dirty', baseBranch: 'main' }),
     ).rejects.toThrow('clean');
   });
+  it('records the target base branch commit when the source checkout is elsewhere', async () => {
+    const repo = fixture();
+    repo.run('switch', '-c', 'other');
+    writeFileSync(join(repo.path, 'other.txt'), 'other');
+    repo.run('add', '.');
+    repo.run('commit', '-m', 'other');
+    const main = execFileSync('git', ['rev-parse', 'main'], { cwd: repo.path }).toString().trim();
+    const manager = new WorkspaceManager(undefined, join(tmpdir(), `codexflow-workspaces-base-${Date.now()}`));
+    const workspace = await manager.createWorkspace({ repositoryPath: repo.path, taskId: 'base', baseBranch: 'main' });
+    expect(workspace.baselineCommit).toBe(main);
+  });
 });

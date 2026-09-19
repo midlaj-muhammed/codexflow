@@ -107,16 +107,52 @@ The dashboard supports importing a local repository, deterministic project scann
 
 ## Remaining Blockers
 
-- HTTP start/cancel endpoints are still intentionally unimplemented after Phase 13B.
-- The browser is not yet connected to RuntimeExecutor, so a task created from the UI still cannot be started end-to-end from the browser.
-- Provider-backed automated repair is not implemented; failed verification is persisted and surfaced as `BLOCKED`.
-- Durable cross-process runtime execution locking is not implemented; duplicate execution prevention is currently in-process.
-- Approval, commit, push, and GitHub PR delivery remain later Phase 13 steps and were not invoked by Phase 13C.
+- Provider-backed automated repair is not implemented. `VerificationRepairLoop` is present, but it cannot yet re-enter `CoreAgentPipeline` with a failure-aware structured provider request and a review-before-retest lifecycle transition without adding a new pipeline path. Failed verification is truthfully persisted as `BLOCKED`; it is never reported as approval-ready.
 
 ## Final Decision
 
-BLOCKED — the factual control-plane/read-model layer is implemented and tested, but the required browser-driven agent execution and delivery controls cannot be truthfully marked complete without an existing-runtime orchestration API.
+BLOCKED — Phase 13D–F are implemented and externally verified, but provider-backed repair remains a required runtime capability before the entire phase can be marked PASS.
 
 ## Next Phase Readiness
 
-NOT READY. The missing runtime-to-HTTP bridge must be implemented before Phase 13 can satisfy the complete developer workflow.
+## Phase 13D — HTTP Runtime Bridge
+
+- Commit: `881a7e4 feat: connect control plane runtime execution`.
+- Added `POST /api/tasks/:id/execute`. It validates UUID input, invokes the existing server-side `RuntimeExecutor`, returns an accepted/current task snapshot, and never accepts browser-supplied edits, paths, provider configuration, or credentials.
+- The server-only control-plane gateway owns a process-local execution registry only for response coalescing; `RuntimeExecutor` owns actual execution.
+- Added the existing SQLite database's minimal `task_execution_locks` migration. Lease acquisition is an atomic conditional upsert, release is owner-bound, and expired leases are reclaimable. Runtime tests cover two executor instances; database tests cover acquisition/release.
+
+## Phase 13E — Browser Runtime Control
+
+- The existing task detail now shows **Start task** only for `CREATED`/`QUEUED` tasks and calls the execute endpoint.
+- The dashboard polls persisted task records while a task is active. Agent runs, safe agent events, plan, review, tests, workspace, approval, and delivery records are reloaded after refresh; no browser-only progress state exists.
+- Runtime continues to publish the existing safe `EventBus` stage events. The UI reads their persisted agent-event counterparts rather than exposing model prompts, provider headers, or credentials.
+- Browser validation (headless Playwright against the running application) created a task through the rendered UI, pressed **Start task**, and observed `PLANNER`, `CODER`, `REVIEWER`, `TESTER`, and `READY_FOR_APPROVAL` on the selected task.
+
+## Phase 13F — Approval, Delivery, and GitHub
+
+- `RuntimeExecutor` now creates the existing fingerprint-bound `ApprovalService` request only after real review and verification complete. It calculates deterministic risk from the actual diff, review findings, and test outcomes.
+- The existing approval endpoint remains server-side authoritative: it calculates the live workspace diff, approves via `ApprovalService`, then delegates to the frozen `DeliveryService`. A repeated approval request safely resumes an already-approved durable delivery.
+- Final verification uses the project scan's actual test command. Repositories with no detected test command use the existing-safe `git diff --check` fallback rather than fabricating a test pass.
+- Fixed an actual workspace baseline bug found by E2E: `WorkspaceManager` now persists the newly-created worktree's actual base commit, not the source checkout's potentially unrelated branch HEAD.
+- Hardened `DeliveryService` to retrieve a newly-created PR when the provider supports retrieval and verify its `headSha` before recording `PR_CREATED`.
+- Browser approval was exercised against the disposable repository. Persisted task `bd27f778-3918-42f0-a34b-db40d4e94186` reached `APPROVED` with delivery `PR_CREATED`; commit `b43958fe316f8ce49a671eb15092af312cf14e07` and PR [#5](https://github.com/midlaj-muhammed/codexflow-github-e2e/pull/5) have matching persisted commit/head identity.
+
+## External Verification
+
+- `pnpm test:openai-e2e` — PASS. Real OpenAI RuntimeExecutor test executed with one real request.
+- `pnpm test:github-e2e` — PASS after creating a fresh clean disposable branch. The first run correctly blocked reuse of an old PR whose head SHA differed; that was environment state, not bypassed. The final rerun exercised creation, retrieval, and durable PR persistence.
+- Browser + HTTP + OpenAI + approval + durable delivery verification — PASS against the disposable GitHub repository. It produced PR #5 above without exposing credentials.
+
+## Final Regression
+
+- `pnpm lint` — PASS (one pre-existing React hook-dependency warning; no lint errors).
+- `pnpm typecheck` — PASS.
+- `pnpm test` — PASS.
+- `pnpm test:e2e` — PASS: Playwright browser smoke suite.
+- Package tests for database, runtime, workspace, agents, git, delivery, and providers — PASS through the full suite.
+- `.env` is ignored. Boolean-only environment preflight confirmed OpenAI and disposable GitHub E2E configuration without reading/logging secret values. Searches found no public OpenAI/GitHub environment variable and no token persistence path.
+
+## Final Limitation
+
+The complete browser-to-GitHub path, approval, durable delivery, PR retrieval, persistence, and cross-process execution lease are implemented and evidenced. Automated provider-backed repair remains the sole Phase 13 blocker; test/review failures are correctly persisted and blocked instead of fabricated as success.

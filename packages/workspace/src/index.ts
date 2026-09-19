@@ -31,12 +31,15 @@ export class WorkspaceManager {
       await rm(rootPath, { recursive: true, force: true });
       throw error;
     }
+    // The source checkout may be on a task branch. Persist the commit the
+    // new worktree actually started from, which is the delivery baseline.
+    const worktreeState = await this.git.inspect(rootPath);
     const workspace = {
       id,
       taskId: input.taskId,
       rootPath,
       branch,
-      baselineCommit: state.head,
+      baselineCommit: worktreeState.head,
       status: 'ACTIVE' as const,
     };
     this.workspaces.set(id, workspace);

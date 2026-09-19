@@ -370,7 +370,7 @@ export class DeliveryService {
       attempt: this.nextAttempt(attempts),
     });
     try {
-      const pullRequest = await this.provider.createPullRequest({
+      const created = await this.provider.createPullRequest({
         owner: record.owner,
         name: record.repository,
         head: record.branch,
@@ -378,6 +378,17 @@ export class DeliveryService {
         title: resolvedMetadata.title,
         body: resolvedMetadata.body,
       });
+      // Creation responses can be stale or incomplete on some providers. Read
+      // the PR back when supported before declaring the durable saga complete.
+      const pullRequest = this.provider.getPullRequest
+        ? await this.provider.getPullRequest({
+            owner: record.owner,
+            name: record.repository,
+            number: created.number,
+          })
+        : created;
+      if (pullRequest.headSha && pullRequest.headSha !== commit.sha)
+        throw new Error('Created pull request does not reference the committed delivery SHA');
       if (attemptId)
         this.store?.updateDeliveryPullRequest(attemptId, {
           status: 'SUCCEEDED',

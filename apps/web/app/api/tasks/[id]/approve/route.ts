@@ -8,10 +8,14 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     const { id } = await params;
     const snapshot = taskSnapshot(id);
     if (!snapshot?.workspace) throw new Error('Approval requires an active workspace');
-    if (snapshot.task.status !== 'READY_FOR_APPROVAL') throw new Error('Task is not ready for approval');
-    const diff = (await controlPlane().git.diff(String(snapshot.workspace.rootPath))).stdout;
-    const approval = new ApprovalService(controlPlane().store).approve(id, 'web-user', diff);
-    controlPlane().store.transitionTask(id, 'APPROVED');
+    let approval = snapshot.approval;
+    if (snapshot.task.status === 'READY_FOR_APPROVAL') {
+      const diff = (await controlPlane().git.diff(String(snapshot.workspace.rootPath))).stdout;
+      approval = new ApprovalService(controlPlane().store).approve(id, 'web-user', diff);
+      controlPlane().store.transitionTask(id, 'APPROVED');
+    } else if (snapshot.task.status !== 'APPROVED' || approval?.state !== 'APPROVED') {
+      throw new Error('Task is not ready for approval');
+    }
     const pullRequest = await deliverApprovedTask(id);
     return NextResponse.json({ approval, pullRequest, task: taskSnapshot(id) });
   } catch (error) {
