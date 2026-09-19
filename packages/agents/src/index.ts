@@ -1,5 +1,8 @@
-import { readFile, readdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readFile, readdir, writeFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { z } from 'zod';
 export type ProjectMetadata = {
   language: string[];
   framework?: string;
@@ -228,5 +231,172 @@ export class AgentRunner {
   }
   stream(runId: string) {
     return this.provider.stream(runId);
+  }
+}
+
+export type VerificationPlan = { commands: string[]; requiresNewTests: boolean; rationale: string };
+export type PlannerResult = {
+  summary: string;
+  affectedFiles: string[];
+  riskSignals: string[];
+  verification: VerificationPlan;
+  existingTests: string[];
+  testsToCreate: string[];
+  expectedBehavior: string;
+};
+export class PlannerAgent {
+  plan(input: { prompt: string; metadata: ProjectMetadata }): PlannerResult {
+    const commands = [
+      input.metadata.testCommand,
+      input.metadata.lintCommand,
+      input.metadata.buildCommand,
+    ].filter((command): command is string => Boolean(command));
+    return {
+      summary: input.prompt,
+      affectedFiles: [],
+      riskSignals: [],
+      verification: {
+        commands,
+        requiresNewTests: /fix|bug|regression/i.test(input.prompt),
+        rationale: commands.length
+          ? 'Run detected project verification commands.'
+          : 'No supported verification command was detected.',
+      },
+      existingTests: input.metadata.testDirectories,
+      testsToCreate: /fix|bug|regression/i.test(input.prompt)
+        ? ['Regression coverage when the bug is reproducible.']
+        : [],
+      expectedBehavior: input.prompt,
+    };
+  }
+}
+export type ReviewFinding = { severity: 'LOW' | 'MEDIUM' | 'HIGH'; message: string; file?: string };
+export class ReviewerAgent {
+  review(input: { changedFiles: string[]; diff: string }): {
+    verdict: 'APPROVED' | 'CHANGES_REQUESTED';
+    findings: ReviewFinding[];
+  } {
+    const findings: ReviewFinding[] = [];
+    if (/\.env|credentials|\.pem|\.key/i.test(`${input.changedFiles.join('\n')}\n${input.diff}`))
+      findings.push({ severity: 'HIGH', message: 'Sensitive file appears in the diff.' });
+    if (/package\.json|pnpm-lock\.yaml/i.test(input.changedFiles.join('\n')))
+      findings.push({ severity: 'MEDIUM', message: 'Dependency changes require review.' });
+    return {
+      verdict: findings.some((finding) => finding.severity === 'HIGH')
+        ? 'CHANGES_REQUESTED'
+        : 'APPROVED',
+      findings,
+    };
+  }
+}
+export type FileEdit = { path: string; content: string };
+export class CoderAgent {
+  async applyEdits(workspacePath: string, edits: FileEdit[]) {
+    for (const edit of edits) {
+      const target = resolve(workspacePath, edit.path);
+      if (
+        isAbsolute(edit.path) ||
+        relative(workspacePath, target).startsWith('..') ||
+        /(^|\/)\.(env|git)(\.|\/|$)|\.pem$|\.key$/i.test(edit.path)
+      )
+        throw new Error(`Edit denied by workspace policy: ${edit.path}`);
+      await writeFile(target, edit.content, 'utf8');
+    }
+    return { changedFiles: edits.map((edit) => edit.path) };
+  }
+  async applyModelOutput(workspacePath: string, output: string) {
+    const payload = z
+      .object({ edits: z.array(z.object({ path: z.string().min(1), content: z.string() })).min(1) })
+      .parse(JSON.parse(output));
+    return this.applyEdits(workspacePath, payload.edits);
+  }
+}
+export class RepairAgent extends CoderAgent {}
+export class SupervisorAgent {
+  constructor(private readonly maxRepairs = 2) {}
+  nextAfterVerification(
+    attempt: number,
+    passed: boolean,
+  ): 'READY_FOR_APPROVAL' | 'REPAIRING' | 'BLOCKED' {
+    if (passed) return 'READY_FOR_APPROVAL';
+    return attempt < this.maxRepairs ? 'REPAIRING' : 'BLOCKED';
+  }
+}
+export class CoreAgentPipeline {
+  constructor(
+    private readonly planner = new PlannerAgent(),
+    private readonly coder = new CoderAgent(),
+    private readonly reviewer = new ReviewerAgent(),
+    private readonly tester = new TesterAgent(),
+    private readonly supervisor = new SupervisorAgent(),
+  ) {}
+  async run(input: {
+    prompt: string;
+    metadata: ProjectMetadata;
+    workspacePath: string;
+    modelOutput: string;
+    diff: string;
+    changedFiles: string[];
+    attempt?: number;
+  }) {
+    const plan = this.planner.plan({ prompt: input.prompt, metadata: input.metadata });
+    const code = await this.coder.applyModelOutput(input.workspacePath, input.modelOutput);
+    const review = this.reviewer.review({
+      changedFiles: input.changedFiles.length ? input.changedFiles : code.changedFiles,
+      diff: input.diff,
+    });
+    const tests = await this.tester.verify(input.workspacePath, plan.verification);
+    const passed = review.verdict === 'APPROVED' && tests.every((test) => test.status === 'PASSED');
+    return {
+      plan,
+      code,
+      review,
+      tests,
+      next: this.supervisor.nextAfterVerification(input.attempt ?? 1, passed),
+    };
+  }
+}
+export type TestExecution = {
+  command: string;
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  status: 'PASSED' | 'FAILED';
+};
+const runProcess = promisify(execFile);
+const prohibited =
+  /(^|\s)(sudo|rm\s+-rf|git\s+reset\s+--hard|git\s+clean\s+-fd|curl|wget|npm\s+install|pnpm\s+add)(\s|$)|[;&|`]/;
+export class TesterAgent {
+  async verify(workspacePath: string, plan: VerificationPlan): Promise<TestExecution[]> {
+    return Promise.all(plan.commands.map((command) => this.execute(workspacePath, command)));
+  }
+  private async execute(cwd: string, command: string): Promise<TestExecution> {
+    if (prohibited.test(command)) throw new Error(`Command denied by policy: ${command}`);
+    const started = Date.now();
+    try {
+      const { stdout, stderr } = await runProcess('sh', ['-lc', command], {
+        cwd,
+        maxBuffer: 10_000_000,
+      });
+      return {
+        command,
+        exitCode: 0,
+        stdout,
+        stderr,
+        durationMs: Date.now() - started,
+        status: 'PASSED',
+      };
+    } catch (error) {
+      const result = error as { code?: number; stdout?: string; stderr?: string };
+      return {
+        command,
+        exitCode: typeof result.code === 'number' ? result.code : null,
+        stdout: result.stdout ?? '',
+        stderr: result.stderr ?? '',
+        durationMs: Date.now() - started,
+        status: 'FAILED',
+      };
+    }
   }
 }
