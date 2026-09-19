@@ -10,6 +10,7 @@ import {
   TesterAgent,
   VerificationRepairLoop,
   OpenAIResponsesProvider,
+  OrchestrationSupervisor,
   RiskEngine,
   scanProject,
   type CoderModelOutput,
@@ -19,6 +20,7 @@ import {
   type ProjectMetadata,
   type ReviewerResult,
   type StructuredCoderProvider,
+  type OrchestrationPlan,
   type TestExecution,
 } from '@codexflow/agents';
 import type { CodexFlowStore } from '@codexflow/database';
@@ -307,6 +309,7 @@ export type RuntimeExecutionResult = {
   review?: ReviewerResult;
   tests: TestExecution[];
   repairAttempts: number;
+  orchestration?: OrchestrationPlan;
   error?: {
     code: string;
     message: string;
@@ -413,6 +416,7 @@ export class RuntimeExecutor {
     let review: ReviewerResult | undefined;
     let tests: TestExecution[] = [];
     let repairAttempts = 0;
+    let orchestration: OrchestrationPlan | undefined;
     const stageRuns = new Map<PipelineStage, string>();
 
     try {
@@ -460,6 +464,16 @@ export class RuntimeExecutor {
       });
 
       const metadata = await this.loadProjectMetadata(workspace.rootPath, project);
+      orchestration = new OrchestrationSupervisor().select({ prompt: task.prompt, metadata });
+      const supervisorRun = this.store.createAgentRun({ taskId, workspaceId: workspace.id, role: 'SUPERVISOR', attempt: 1 });
+      this.store.updateAgentRun(supervisorRun.id, { status: 'COMPLETED' });
+      this.store.appendAgentEvent({ agentRunId: supervisorRun.id, type: 'agent.completed', payload: {
+        role: 'SUPERVISOR', strategy: orchestration.strategy, stages: orchestration.stages,
+        maxProviderRequests: orchestration.maxProviderRequests, maxTotalAttempts: orchestration.maxTotalAttempts,
+      } });
+      await this.events.emit({ type: 'agent.completed', taskId, at: new Date().toISOString(), payload: {
+        role: 'SUPERVISOR', strategy: orchestration.strategy, maxProviderRequests: orchestration.maxProviderRequests,
+      } });
       const result = await this.pipeline.run({
         prompt: task.prompt,
         metadata,
@@ -582,6 +596,7 @@ export class RuntimeExecutor {
           review,
           tests,
           repairAttempts,
+          orchestration,
         };
       }
 
@@ -603,7 +618,7 @@ export class RuntimeExecutor {
         at: new Date().toISOString(),
         payload: { error: failure.message, code: failure.code },
       });
-      return this.failed(taskId, stages, failure, currentState, workspace, changedFiles, diff, review, tests);
+      return { ...this.failed(taskId, stages, failure, currentState, workspace, changedFiles, diff, review, tests), orchestration };
     } finally {
       if (hasExecutionLock) this.store.releaseTaskExecutionLock(taskId, lockOwner);
       this.activeTasks.delete(taskId);

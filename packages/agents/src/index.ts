@@ -436,6 +436,54 @@ export class SupervisorAgent {
     return attempt < this.maxRepairs ? 'REPAIRING' : 'BLOCKED';
   }
 }
+export type AgentCapability = 'READ' | 'WRITE' | 'EXECUTE' | 'CONTROL';
+export type AgentDefinition = {
+  role: 'PLANNER' | 'CODER' | 'REVIEWER' | 'TESTER' | 'REPAIR';
+  capabilities: readonly AgentCapability[];
+  maxAttempts: number;
+  allowedTools: readonly ('filesystem' | 'git-diff' | 'verification')[];
+};
+export const defaultAgentDefinitions: readonly AgentDefinition[] = [
+  { role: 'PLANNER', capabilities: ['READ'], maxAttempts: 1, allowedTools: ['filesystem', 'git-diff'] },
+  { role: 'CODER', capabilities: ['READ', 'WRITE'], maxAttempts: 1, allowedTools: ['filesystem', 'git-diff'] },
+  { role: 'REVIEWER', capabilities: ['READ'], maxAttempts: 1, allowedTools: ['filesystem', 'git-diff'] },
+  { role: 'TESTER', capabilities: ['READ', 'EXECUTE'], maxAttempts: 1, allowedTools: ['filesystem', 'verification'] },
+  { role: 'REPAIR', capabilities: ['READ', 'WRITE', 'EXECUTE'], maxAttempts: 2, allowedTools: ['filesystem', 'git-diff', 'verification'] },
+] as const;
+export type TaskStrategy = 'BUG_FIX' | 'REFACTOR' | 'SECURITY' | 'TEST_GENERATION';
+export type OrchestrationPlan = {
+  strategy: TaskStrategy;
+  stages: readonly PipelineStage[];
+  maxProviderRequests: number;
+  maxTotalAttempts: number;
+  verification: 'TESTS' | 'TESTS_AND_LINT' | 'TESTS_LINT_AND_BUILD';
+};
+/**
+ * A deterministic control-flow policy. It selects only validated stage orders;
+ * agents never select lifecycle transitions or arbitrary commands themselves.
+ */
+export class OrchestrationSupervisor {
+  select(input: { prompt: string; metadata: ProjectMetadata }): OrchestrationPlan {
+    const prompt = input.prompt.toLowerCase();
+    const strategy: TaskStrategy = /security|auth|credential|permission/.test(prompt)
+      ? 'SECURITY'
+      : /refactor|rename|restructure/.test(prompt)
+        ? 'REFACTOR'
+        : /test|coverage|spec/.test(prompt)
+          ? 'TEST_GENERATION'
+          : 'BUG_FIX';
+    const verification = strategy === 'SECURITY' || strategy === 'REFACTOR'
+      ? input.metadata.buildCommand ? 'TESTS_LINT_AND_BUILD' : 'TESTS_AND_LINT'
+      : 'TESTS';
+    return {
+      strategy,
+      stages: ['PLANNER', 'CODER', 'REVIEWER', 'TESTER'],
+      maxProviderRequests: 1 + 2,
+      maxTotalAttempts: 1 + 2,
+      verification,
+    };
+  }
+}
 export type PipelineStage = 'PLANNER' | 'CODER' | 'REVIEWER' | 'TESTER' | 'REPAIR';
 export type CoderStageResult = {
   modelOutput: CoderModelOutput;

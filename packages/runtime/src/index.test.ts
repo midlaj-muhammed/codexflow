@@ -210,11 +210,13 @@ describe('runtime', () => {
       branch: `codexflow/task-${task.id}`,
     });
     expect(store.listAgentRuns(String(task.id))).toEqual([
+      expect.objectContaining({ role: 'SUPERVISOR', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'PLANNER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'CODER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'REVIEWER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'TESTER', status: 'COMPLETED' }),
     ]);
+    expect(result.orchestration).toMatchObject({ strategy: 'BUG_FIX', maxTotalAttempts: 3 });
     const coderRun = store
       .listAgentRuns(String(task.id))
       .find((run) => run.role === 'CODER');

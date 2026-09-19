@@ -8,6 +8,7 @@ import {
   CoreAgentPipeline,
   MockAgentProvider,
   OpenAIResponsesProvider,
+  OrchestrationSupervisor,
   PlannerAgent,
   ReviewerAgent,
   RiskEngine,
@@ -403,5 +404,15 @@ describe('scanner and mock provider', () => {
     first.approve('t', 'human', 'diff');
     const restarted = new ApprovalService(persistence);
     expect(restarted.assertMayApply('t', 'diff')).toMatchObject({ state: 'APPROVED' });
+  });
+  it('selects bounded, validated strategies without letting an agent invent a graph', () => {
+    const supervisor = new OrchestrationSupervisor();
+    const metadata = { language: ['TypeScript'], sourceDirectories: ['src'], testDirectories: ['tests'], configFiles: [], testCommand: 'pnpm test', lintCommand: 'pnpm lint', buildCommand: 'pnpm build' };
+    expect(supervisor.select({ prompt: 'Fix authentication security bug', metadata })).toMatchObject({
+      strategy: 'SECURITY', stages: ['PLANNER', 'CODER', 'REVIEWER', 'TESTER'], verification: 'TESTS_LINT_AND_BUILD', maxTotalAttempts: 3,
+    });
+    expect(supervisor.select({ prompt: 'Refactor parser names', metadata }).strategy).toBe('REFACTOR');
+    expect(supervisor.select({ prompt: 'Add regression coverage', metadata }).strategy).toBe('TEST_GENERATION');
+    expect(supervisor.select({ prompt: 'Fix the parser bug', metadata }).strategy).toBe('BUG_FIX');
   });
 });
