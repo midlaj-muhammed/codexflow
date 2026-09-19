@@ -67,6 +67,19 @@ export class GitEngine {
   commit(path: string, message: string) {
     return this.run(path, ['commit', '-am', message]);
   }
+  stage(path: string, files: string[]) {
+    if (!files.length) throw new GitError('No files selected for staging');
+    return this.run(path, ['add', '--', ...files]);
+  }
+  revParse(path: string, ref = 'HEAD') {
+    return this.run(path, ['rev-parse', ref]);
+  }
+  changedFiles(path: string) {
+    return this.run(path, ['diff', '--name-only']);
+  }
+  commitStaged(path: string, message: string) {
+    return this.run(path, ['commit', '-m', message]);
+  }
   push(path: string, remote = 'origin', branch?: string) {
     return this.run(path, ['push', remote, branch ?? 'HEAD']);
   }
