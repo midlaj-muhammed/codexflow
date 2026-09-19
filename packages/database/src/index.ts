@@ -104,6 +104,13 @@ export class CodexFlowStore {
       )
       .get(id) as Record<string, unknown> | undefined;
   }
+  listRepositories() {
+    return this.db
+      .prepare(
+        'SELECT id, provider, owner, name, url, default_branch AS defaultBranch, local_path AS localPath, created_at AS createdAt, updated_at AS updatedAt FROM repositories ORDER BY updated_at DESC',
+      )
+      .all() as Record<string, unknown>[];
+  }
   createProject(repositoryId: string, name: string, metadata: Record<string, unknown> = {}) {
     const id = randomUUID(),
       timestamp = now();
@@ -111,6 +118,24 @@ export class CodexFlowStore {
       .prepare('INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?)')
       .run(id, repositoryId, name, JSON.stringify(metadata), timestamp, timestamp);
     return { id, repositoryId, name, metadata, createdAt: timestamp, updatedAt: timestamp };
+  }
+  getProject(id: string) {
+    const row = this.db
+      .prepare(
+        'SELECT id, repository_id AS repositoryId, name, metadata, created_at AS createdAt, updated_at AS updatedAt FROM projects WHERE id = ?',
+      )
+      .get(id) as Record<string, unknown> | undefined;
+    return row ? { ...row, metadata: JSON.parse(String(row.metadata ?? '{}')) } : undefined;
+  }
+  listProjects() {
+    return (this.db
+      .prepare(
+        'SELECT id, repository_id AS repositoryId, name, metadata, created_at AS createdAt, updated_at AS updatedAt FROM projects ORDER BY updated_at DESC',
+      )
+      .all() as Record<string, unknown>[]).map((row) => ({
+      ...row,
+      metadata: JSON.parse(String(row.metadata ?? '{}')),
+    }));
   }
   createTask(projectId: string, prompt: string) {
     if (!prompt.trim()) throw new Error('Task prompt must not be empty');
@@ -129,6 +154,16 @@ export class CodexFlowStore {
         'SELECT id, project_id AS projectId, prompt, status, risk_level AS riskLevel, delivery_status AS deliveryStatus, delivery_error AS deliveryError, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE id = ?',
       )
       .get(id) as Record<string, unknown> | undefined;
+  }
+  listTasks(projectId?: string) {
+    const statement = projectId
+      ? this.db.prepare(
+          'SELECT id, project_id AS projectId, prompt, status, risk_level AS riskLevel, delivery_status AS deliveryStatus, delivery_error AS deliveryError, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE project_id = ? ORDER BY updated_at DESC',
+        )
+      : this.db.prepare(
+          'SELECT id, project_id AS projectId, prompt, status, risk_level AS riskLevel, delivery_status AS deliveryStatus, delivery_error AS deliveryError, created_at AS createdAt, updated_at AS updatedAt FROM tasks ORDER BY updated_at DESC',
+        );
+    return (projectId ? statement.all(projectId) : statement.all()) as Record<string, unknown>[];
   }
   transitionTask(id: string, status: string) {
     const result = this.db
@@ -161,12 +196,40 @@ export class CodexFlowStore {
       updatedAt: timestamp,
     };
   }
+  getWorkspaceForTask(taskId: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, root_path AS rootPath, branch, baseline_commit AS baselineCommit, status, created_at AS createdAt, updated_at AS updatedAt FROM workspaces WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
+  }
   listTaskTimeline(taskId: string) {
     return this.db
       .prepare(
         'SELECT ar.id, ar.role, ar.status, ar.attempt, ar.started_at AS startedAt, ar.finished_at AS finishedAt FROM agent_runs ar WHERE ar.task_id = ? ORDER BY ar.created_at',
       )
       .all(taskId);
+  }
+  listPlans(taskId: string) {
+    return (this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, content, affected_files AS affectedFiles, risks, created_at AS createdAt FROM plans WHERE task_id = ? ORDER BY created_at DESC',
+      )
+      .all(taskId) as Record<string, unknown>[]).map((row) => ({
+      ...row,
+      affectedFiles: JSON.parse(String(row.affectedFiles ?? '[]')),
+      risks: JSON.parse(String(row.risks ?? '[]')),
+    }));
+  }
+  listReviews(taskId: string) {
+    return (this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, agent_run_id AS agentRunId, verdict, findings, created_at AS createdAt FROM reviews WHERE task_id = ? ORDER BY created_at DESC',
+      )
+      .all(taskId) as Record<string, unknown>[]).map((row) => ({
+      ...row,
+      findings: JSON.parse(String(row.findings ?? '[]')),
+    }));
   }
   recordTestRun(input: {
     taskId: string;
@@ -322,6 +385,13 @@ export class CodexFlowStore {
         'SELECT id, task_id AS taskId, workspace_id AS workspaceId, sha, branch, message, baseline_sha AS baselineSha, diff_fingerprint AS diffFingerprint, status, created_at AS createdAt FROM delivery_commits WHERE task_id = ? AND diff_fingerprint = ?',
       )
       .get(taskId, diffFingerprint) as Record<string, unknown> | undefined;
+  }
+  findLatestDeliveryCommit(taskId: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, sha, branch, message, baseline_sha AS baselineSha, diff_fingerprint AS diffFingerprint, status, created_at AS createdAt FROM delivery_commits WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
+      )
+      .get(taskId) as Record<string, unknown> | undefined;
   }
   createDeliveryPush(input: {
     taskId: string;

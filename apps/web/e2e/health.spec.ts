@@ -1,10 +1,12 @@
 import { expect, test } from '@playwright/test';
 
-test('shows the Phase 0 foundation and health endpoint', async ({ page, request }) => {
+test('shows developer control plane and health endpoint', async ({ page, request }) => {
   await page.goto('/');
   await expect(
-    page.getByRole('heading', { name: /mission control for ai coding agents/i }),
+    page.getByRole('heading', { name: /understand every agent change before it reaches github/i }),
   ).toBeVisible();
+  await expect(page.getByRole('heading', { name: /import a local repository/i })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /^tasks$/i })).toBeVisible();
 
   const response = await request.get('/api/health');
   await expect(response).toBeOK();

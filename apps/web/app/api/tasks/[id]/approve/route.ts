@@ -1,0 +1,19 @@
+import { NextResponse } from 'next/server';
+import { ApprovalService } from '@codexflow/agents';
+import { apiError } from '@/lib/api';
+import { controlPlane, taskSnapshot } from '@/lib/control-plane';
+
+export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+  try {
+    const { id } = await params;
+    const snapshot = taskSnapshot(id);
+    if (!snapshot?.workspace) throw new Error('Approval requires an active workspace');
+    if (snapshot.task.status !== 'READY_FOR_APPROVAL') throw new Error('Task is not ready for approval');
+    const diff = (await controlPlane().git.diff(String(snapshot.workspace.rootPath))).stdout;
+    const approval = new ApprovalService(controlPlane().store).approve(id, 'web-user', diff);
+    controlPlane().store.transitionTask(id, 'APPROVED');
+    return NextResponse.json({ approval, task: taskSnapshot(id) });
+  } catch (error) {
+    return apiError(error);
+  }
+}

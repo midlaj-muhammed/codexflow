@@ -74,4 +74,18 @@ describe('CodexFlowStore', () => {
     ).toThrow();
     expect(() => store.createTask('missing', ' ')).toThrow('Task prompt');
   });
+  it('lists control-plane entities and resolves the task workspace', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const repository = store.createRepository({
+      provider: 'github', owner: 'acme', name: 'control-plane',
+      url: 'https://github.com/acme/control-plane', defaultBranch: 'main', localPath: '/tmp/control-plane',
+    });
+    const project = store.createProject(String(repository.id), 'Control plane', { framework: 'Next.js' });
+    const task = store.createTask(project.id, 'Show persisted task state');
+    store.createWorkspace(String(task.id), '/tmp/control-plane/task', 'codexflow/task-ui', 'base');
+    expect(store.listRepositories()).toHaveLength(1);
+    expect(store.listProjects()[0]).toMatchObject({ id: project.id, metadata: { framework: 'Next.js' } });
+    expect(store.listTasks()).toHaveLength(1);
+    expect(store.getWorkspaceForTask(String(task.id))).toMatchObject({ branch: 'codexflow/task-ui' });
+  });
 });
