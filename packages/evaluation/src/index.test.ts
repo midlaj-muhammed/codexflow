@@ -21,7 +21,7 @@ describe('evaluation persistence and metrics', () => {
     const benchmark = store.createBenchmark({ name: 'starter', description: 'controlled local fixtures', version: '1.0.0' });
     const task = store.createBenchmarkTask({ benchmarkId: benchmark.id, ...starterBenchmarkFixtures[0] });
     const result = store.createEvaluationRun({ benchmarkTaskId: task.id, finalState: 'READY_FOR_APPROVAL', technicalSuccess: true, reviewPassed: true, verificationPassed: true, repairAttempts: 0, durationMs: 42, filesChanged: 1, linesAdded: 1, linesRemoved: 1 });
-    expect(store.getEvaluationRun(result.id)).toMatchObject({ benchmarkTaskId: task.id, tokenUsage: undefined, costUsd: undefined });
+    expect(store.getEvaluationRun(result.id)).toMatchObject({ benchmarkTaskId: task.id, tokenUsage: undefined, costUsd: undefined, plannedStages: [], executedStages: [], specialistOutcomes: {} });
     expect(calculateEvaluationMetrics(store.listEvaluationRuns())).toMatchObject({ passAt1: 1, finalTaskSuccessRate: 1, repairRate: 0 });
   });
   it('keeps blocked and repaired outcomes distinct', () => {
@@ -57,7 +57,53 @@ describe('evaluation persistence and metrics', () => {
     const runtime = new RuntimeExecutor({ store, provider, workspaceManager: new WorkspaceManager(new GitEngine(), join(root, 'workspaces')) });
     const runner = new EvaluationRunner(store, runtime);
     const result = await runner.run(benchmarkTask, async () => ({ taskId: String(task.id), repositoryCommit: baseline, provider: 'test', model: 'deterministic' }));
-    expect(result).toMatchObject({ taskId: task.id, technicalSuccess: true, verificationPassed: true, filesChanged: 1 });
+    expect(result).toMatchObject({
+      taskId: task.id,
+      technicalSuccess: true,
+      verificationPassed: true,
+      filesChanged: 1,
+      strategy: 'BUG_FIX',
+      plannedStages: ['PLANNER', 'CODER', 'REVIEWER', 'TESTER'],
+      executedStages: expect.arrayContaining([
+        expect.objectContaining({ role: 'PLANNER', status: 'COMPLETED' }),
+        expect.objectContaining({ role: 'CODER', status: 'COMPLETED' }),
+      ]),
+    });
     expect(store.listTestRuns(String(task.id))).toEqual([expect.objectContaining({ status: 'PASSED' })]);
+  });
+  it('persists specialist provenance for strategy-aware evaluation runs', async () => {
+    const store = new CodexFlowStore(openDatabase());
+    const benchmark = store.createBenchmark({ name: 'specialists', description: 'strategy provenance', version: '1' });
+    const benchmarkTask = store.createBenchmarkTask({ benchmarkId: benchmark.id, ...starterBenchmarkFixtures[4] });
+    const repository = store.createRepository({ provider: 'github', owner: 'acme', name: 'specialists', url: 'https://example.test/specialists', defaultBranch: 'main' });
+    const project = store.createProject(String(repository.id), 'specialists');
+    const task = store.createTask(String(project.id), 'Add regression test coverage');
+    const runtime = {
+      execute: async () => ({
+        taskId: 'task-1',
+        status: 'SUCCEEDED' as const,
+        finalState: 'READY_FOR_APPROVAL' as const,
+        stages: [
+          { stage: 'PLANNER' as const, role: 'PLANNER' as const, status: 'COMPLETED' as const },
+          { stage: 'CODER' as const, role: 'CODER' as const, status: 'COMPLETED' as const },
+          { stage: 'TEST_GENERATOR' as const, role: 'TEST_GENERATOR' as const, status: 'COMPLETED' as const },
+          { stage: 'REVIEWER' as const, role: 'REVIEWER' as const, status: 'COMPLETED' as const },
+          { stage: 'TESTER' as const, role: 'TESTER' as const, status: 'COMPLETED' as const },
+        ],
+        changedFiles: ['tests/generated.test.js'],
+        diff: '+generated',
+        review: { verdict: 'APPROVED' as const, findings: [] },
+        tests: [{ command: 'node tests/generated.test.js', exitCode: 0, stdout: '', stderr: '', durationMs: 1, status: 'PASSED' as const }],
+        repairAttempts: 0,
+        orchestration: { strategy: 'TEST_GENERATION' as const, stages: ['PLANNER', 'CODER', 'TEST_GENERATOR', 'REVIEWER', 'TESTER'] as const, maxProviderRequests: 3, maxTotalAttempts: 3, verification: 'TESTS' as const },
+      }),
+    };
+    const runner = new EvaluationRunner(store, runtime);
+    const result = await runner.run(benchmarkTask, async () => ({ taskId: String(task.id) }));
+    expect(result).toMatchObject({
+      strategy: 'TEST_GENERATION',
+      plannedStages: ['PLANNER', 'CODER', 'TEST_GENERATOR', 'REVIEWER', 'TESTER'],
+      specialistOutcomes: { TEST_GENERATOR: 'COMPLETED' },
+    });
   });
 });

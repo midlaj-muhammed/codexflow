@@ -22,7 +22,10 @@ function git(cwd: string, ...args: string[]) {
   return execFileSync('git', args, { cwd }).toString().trim();
 }
 
-async function runtimeFixture(testCommand = 'test -f src/message.txt') {
+async function runtimeFixture(
+  testCommand = 'test -f src/message.txt',
+  prompt = 'Change src/message.txt to say hello codexflow',
+) {
   const root = await mkdtemp(join(tmpdir(), 'runtime-executor-'));
   const repositoryPath = join(root, 'repo');
   mkdirSync(join(repositoryPath, 'src'), { recursive: true });
@@ -47,7 +50,7 @@ async function runtimeFixture(testCommand = 'test -f src/message.txt') {
     localPath: repositoryPath,
   });
   const project = store.createProject(String(repository.id), 'Runtime fixture');
-  const task = store.createTask(project.id, 'Change src/message.txt to say hello codexflow');
+  const task = store.createTask(project.id, prompt);
   return { root, repositoryPath, store, task };
 }
 
@@ -59,6 +62,8 @@ function provider(output: { path: string; content: string }): StructuredCoderPro
     }),
   };
 }
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function executorFor(
   fixture: Awaited<ReturnType<typeof runtimeFixture>>,
@@ -348,6 +353,143 @@ describe('runtime', () => {
     });
     release();
     await expect(first).resolves.toMatchObject({ status: 'SUCCEEDED' });
+  });
+  it('enforces provider budgets before downstream approval', async () => {
+    const fixture = await runtimeFixture();
+    const lowBudgetSupervisor = {
+      select: () => ({
+        strategy: 'BUG_FIX' as const,
+        stages: ['PLANNER', 'CODER', 'REVIEWER', 'TESTER'] as const,
+        maxProviderRequests: 0,
+        maxTotalAttempts: 1,
+        verification: 'TESTS' as const,
+      }),
+    };
+    const result = await new RuntimeExecutor({
+      store: fixture.store,
+      provider: provider({ path: 'src/message.txt', content: 'hello codexflow' }),
+      workspaceManager: new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')),
+      supervisor: lowBudgetSupervisor,
+    }).execute(String(fixture.task.id));
+    expect(result).toMatchObject({
+      status: 'FAILED',
+      finalState: 'FAILED',
+      error: { code: 'BUDGET_EXHAUSTED' },
+    });
+    expect(fixture.store.loadApproval(String(fixture.task.id))).toBeUndefined();
+  });
+  it('times out a stage and records the agent run as timed out', async () => {
+    const fixture = await runtimeFixture();
+    const slowProvider: StructuredCoderProvider = {
+      runCoder: async () => {
+        await sleep(30);
+        return { edits: [{ path: 'src/message.txt', content: 'hello codexflow' }] };
+      },
+    };
+    const result = await new RuntimeExecutor({
+      store: fixture.store,
+      provider: slowProvider,
+      workspaceManager: new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')),
+      stageTimeoutMs: 1,
+    }).execute(String(fixture.task.id));
+    expect(result).toMatchObject({ status: 'FAILED', finalState: 'FAILED', error: { code: 'STAGE_TIMEOUT' } });
+    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'CODER', status: 'TIMED_OUT' }),
+    ]));
+  });
+  it('cancels active execution, persists cancellation, and releases the execution lease', async () => {
+    const fixture = await runtimeFixture();
+    let providerStarted!: () => void;
+    const providerStartedPromise = new Promise<void>((resolve) => {
+      providerStarted = resolve;
+    });
+    const slowProvider: StructuredCoderProvider = {
+      runCoder: async () => {
+        providerStarted();
+        await sleep(50);
+        return { edits: [{ path: 'src/message.txt', content: 'hello codexflow' }] };
+      },
+    };
+    const executor = new RuntimeExecutor({
+      store: fixture.store,
+      provider: slowProvider,
+      workspaceManager: new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')),
+    });
+    const running = executor.execute(String(fixture.task.id));
+    await providerStartedPromise;
+    await expect(executor.cancel(String(fixture.task.id))).resolves.toBe(true);
+    await expect(running).resolves.toMatchObject({
+      status: 'CANCELLED',
+      finalState: 'CANCELLED',
+      error: { code: 'CANCELLED' },
+    });
+    expect(fixture.store.getTaskExecutionLock(String(fixture.task.id))).toBeUndefined();
+    expect(fixture.store.loadApproval(String(fixture.task.id))).toBeUndefined();
+  });
+  it('cancels a task before any agent starts', async () => {
+    const fixture = await runtimeFixture();
+    const executor = executorFor(fixture, provider({ path: 'src/message.txt', content: 'hello codexflow' }));
+    await expect(executor.cancel(String(fixture.task.id))).resolves.toBe(true);
+    await expect(executor.execute(String(fixture.task.id))).resolves.toMatchObject({
+      status: 'FAILED',
+      error: { code: 'INVALID_TASK_STATE' },
+    });
+    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toHaveLength(0);
+  });
+  it('reuses completed TestGenerator specialist state during resumed execution', async () => {
+    const fixture = await runtimeFixture(
+      'test -f generated.test.txt',
+      'Add regression test coverage while changing src/message.txt to hello codexflow',
+    );
+    const workspace = await new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')).createWorkspace({
+      repositoryPath: fixture.repositoryPath,
+      taskId: String(fixture.task.id),
+      baseBranch: 'main',
+    });
+    const persistedWorkspace = fixture.store.createWorkspace(String(fixture.task.id), workspace.rootPath, workspace.branch, workspace.baselineCommit);
+    fixture.store.transitionTask(String(fixture.task.id), 'CODING');
+    writeFileSync(join(workspace.rootPath, 'generated.test.txt'), 'generated\n');
+    const run = fixture.store.createAgentRun({ taskId: String(fixture.task.id), workspaceId: persistedWorkspace.id, role: 'TEST_GENERATOR' });
+    fixture.store.updateAgentRun(run.id, { status: 'COMPLETED' });
+    fixture.store.appendAgentEvent({ agentRunId: run.id, type: 'agent.completed', payload: { summary: 'already generated', changedFiles: ['generated.test.txt'], editPaths: ['generated.test.txt'] } });
+    let providerCalls = 0;
+    const providerForResume: StructuredCoderProvider = {
+      runCoder: async () => {
+        providerCalls += 1;
+        return { edits: [{ path: 'src/message.txt', content: 'hello codexflow' }] };
+      },
+    };
+    const result = await executorFor(fixture, providerForResume).execute(String(fixture.task.id));
+    expect(result).toMatchObject({ status: 'SUCCEEDED', finalState: 'READY_FOR_APPROVAL' });
+    expect(providerCalls).toBe(1);
+    expect(fixture.store.listAgentRuns(String(fixture.task.id)).filter((candidate) => candidate.role === 'TEST_GENERATOR')).toHaveLength(1);
+    expect(readFileSync(join(result.workspace!.rootPath, 'generated.test.txt'), 'utf8')).toBe('generated\n');
+  });
+  it('reuses completed SecurityReviewer specialist state during resumed execution', async () => {
+    const fixture = await runtimeFixture(
+      'test -f src/message.txt',
+      'Fix the security permission bug in src/message.txt',
+    );
+    const workspace = await new WorkspaceManager(new GitEngine(), join(fixture.root, 'workspaces')).createWorkspace({
+      repositoryPath: fixture.repositoryPath,
+      taskId: String(fixture.task.id),
+      baseBranch: 'main',
+    });
+    const persistedWorkspace = fixture.store.createWorkspace(String(fixture.task.id), workspace.rootPath, workspace.branch, workspace.baselineCommit);
+    fixture.store.transitionTask(String(fixture.task.id), 'REVIEWING');
+    const run = fixture.store.createAgentRun({ taskId: String(fixture.task.id), workspaceId: persistedWorkspace.id, role: 'SECURITY_REVIEWER' });
+    fixture.store.updateAgentRun(run.id, { status: 'COMPLETED' });
+    fixture.store.appendAgentEvent({ agentRunId: run.id, type: 'agent.completed', payload: { verdict: 'PASSED', findings: [], affectedFiles: [], recommendations: [] } });
+    let providerCalls = 0;
+    const result = await executorFor(fixture, {
+      runCoder: async () => {
+        providerCalls += 1;
+        return { edits: [{ path: 'src/message.txt', content: 'hello codexflow' }] };
+      },
+    }).execute(String(fixture.task.id));
+    expect(result).toMatchObject({ status: 'SUCCEEDED', finalState: 'READY_FOR_APPROVAL' });
+    expect(providerCalls).toBe(1);
+    expect(fixture.store.listAgentRuns(String(fixture.task.id)).filter((candidate) => candidate.role === 'SECURITY_REVIEWER')).toHaveLength(1);
   });
   it('executes deterministic workflow to approval', async () => {
     await expect(runMockWorkflow('x')).resolves.toMatchObject({

@@ -128,12 +128,13 @@ describeRealOpenAi('RuntimeExecutor real OpenAI E2E', () => {
         stdout: expect.stringContaining('math ok'),
       }),
     ]);
-    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toEqual([
+    expect(fixture.store.listAgentRuns(String(fixture.task.id))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: 'SUPERVISOR', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'PLANNER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'CODER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'REVIEWER', status: 'COMPLETED' }),
       expect.objectContaining({ role: 'TESTER', status: 'COMPLETED' }),
-    ]);
+    ]));
 
     const persisted = JSON.stringify({
       events: runtimeEvents,

@@ -21,6 +21,9 @@ import {
   type ReviewerResult,
   type StructuredCoderProvider,
   type OrchestrationPlan,
+  type PipelineStageResult,
+  type SecurityReviewResult,
+  type TestGenerationResult,
   type TestExecution,
 } from '@codexflow/agents';
 import type { CodexFlowStore } from '@codexflow/database';
@@ -295,7 +298,7 @@ export type RuntimeExecutionStage = {
 };
 export type RuntimeExecutionResult = {
   taskId: string;
-  status: 'SUCCEEDED' | 'FAILED' | 'BLOCKED';
+  status: 'SUCCEEDED' | 'FAILED' | 'BLOCKED' | 'CANCELLED';
   finalState?: TaskStatus;
   workspace?: {
     id: string;
@@ -327,7 +330,11 @@ export class RuntimeExecutorError extends Error {
       | 'PROVIDER_NOT_CONFIGURED'
       | 'WORKSPACE_ERROR'
       | 'PIPELINE_FAILED'
-      | 'REPAIR_REQUIRED',
+      | 'REPAIR_REQUIRED'
+      | 'BUDGET_EXHAUSTED'
+      | 'STAGE_TIMEOUT'
+      | 'EXECUTION_TIMEOUT'
+      | 'CANCELLED',
     message: string,
   ) {
     super(message);
@@ -341,6 +348,10 @@ export type RuntimeExecutorOptions = {
   workspaceManager?: WorkspaceManager;
   git?: GitEngine;
   pipeline?: CoreAgentPipeline;
+  supervisor?: OrchestrationSupervisor;
+  stageTimeoutMs?: number;
+  overallTimeoutMs?: number;
+  leaseMs?: number;
 };
 
 const stageRoles: Record<PipelineStage, AgentRole> = {
@@ -353,6 +364,14 @@ const stageRoles: Record<PipelineStage, AgentRole> = {
   REPAIR: 'REPAIR',
 };
 const startableStates = new Set<TaskStatus>(['CREATED', 'QUEUED']);
+const resumableStates = new Set<TaskStatus>([
+  'PLANNING',
+  'CONTEXT_READY',
+  'CODING',
+  'REVIEWING',
+  'TESTING',
+  'REPAIRING',
+]);
 const agentEventTypes: Record<RuntimeExecutionStageStatus, RuntimeEventType> = {
   STARTED: 'agent.started',
   COMPLETED: 'agent.completed',
@@ -370,7 +389,12 @@ export class RuntimeExecutor {
   private readonly workspaceManager: WorkspaceManager;
   private readonly git: GitEngine;
   private readonly pipeline: CoreAgentPipeline;
+  private readonly supervisor: OrchestrationSupervisor;
+  private readonly stageTimeoutMs?: number;
+  private readonly overallTimeoutMs?: number;
+  private readonly leaseMs?: number;
   private readonly activeTasks = new Set<string>();
+  private readonly activeControllers = new Map<string, AbortController>();
 
   constructor(options: RuntimeExecutorOptions) {
     this.store = options.store;
@@ -390,6 +414,10 @@ export class RuntimeExecutor {
     this.workspaceManager = options.workspaceManager ?? new WorkspaceManager();
     this.git = options.git ?? new GitEngine();
     this.pipeline = options.pipeline ?? new CoreAgentPipeline();
+    this.supervisor = options.supervisor ?? new OrchestrationSupervisor();
+    this.stageTimeoutMs = options.stageTimeoutMs;
+    this.overallTimeoutMs = options.overallTimeoutMs;
+    this.leaseMs = options.leaseMs;
   }
 
   static fromEnvironment(options: Omit<RuntimeExecutorOptions, 'provider'>) {
@@ -408,6 +436,8 @@ export class RuntimeExecutor {
         new RuntimeExecutorError('DUPLICATE_EXECUTION', `Task is already executing: ${taskId}`),
       );
     this.activeTasks.add(taskId);
+    const controller = new AbortController();
+    this.activeControllers.set(taskId, controller);
     const lockOwner = randomUUID();
     let hasExecutionLock = false;
     const stages: RuntimeExecutionStage[] = [];
@@ -419,17 +449,23 @@ export class RuntimeExecutor {
     let tests: TestExecution[] = [];
     let repairAttempts = 0;
     let orchestration: OrchestrationPlan | undefined;
+    let providerRequests = 0;
+    let overallTimeout: ReturnType<typeof setTimeout> | undefined;
+    if (this.overallTimeoutMs) {
+      overallTimeout = setTimeout(() => controller.abort(new Error('Runtime execution timed out')), this.overallTimeoutMs);
+    }
     const stageRuns = new Map<PipelineStage, string>();
 
     try {
+      this.throwIfAborted(controller.signal);
       const task = this.loadTask(taskId);
-      hasExecutionLock = this.store.acquireTaskExecutionLock(taskId, lockOwner);
+      hasExecutionLock = this.store.acquireTaskExecutionLock(taskId, lockOwner, this.leaseMs);
       if (!hasExecutionLock)
         throw new RuntimeExecutorError(
           'DUPLICATE_EXECUTION',
           `Task is already executing: ${taskId}`,
         );
-      if (!startableStates.has(task.status))
+      if (!startableStates.has(task.status) && !resumableStates.has(task.status))
         throw new RuntimeExecutorError(
           'INVALID_TASK_STATE',
           `Task ${taskId} cannot execute from ${task.status}`,
@@ -438,7 +474,7 @@ export class RuntimeExecutor {
       if (currentState === 'CREATED')
         currentState = await this.transition(taskId, currentState, 'QUEUED');
       await this.events.emit({ type: 'task.started', taskId, at: new Date().toISOString() });
-      currentState = await this.transition(taskId, currentState, 'PLANNING');
+      if (currentState === 'QUEUED') currentState = await this.transition(taskId, currentState, 'PLANNING');
 
       const project = this.loadProject(task.projectId);
       const repository = this.loadRepository(project.repositoryId);
@@ -466,7 +502,8 @@ export class RuntimeExecutor {
       });
 
       const metadata = await this.loadProjectMetadata(workspace.rootPath, project);
-      orchestration = new OrchestrationSupervisor().select({ prompt: task.prompt, metadata });
+      orchestration = this.supervisor.select({ prompt: task.prompt, metadata });
+      const completedStages = await this.completedStageResults(taskId, workspace, orchestration);
       const supervisorRun = this.store.createAgentRun({ taskId, workspaceId: workspace.id, role: 'SUPERVISOR', attempt: 1 });
       this.store.updateAgentRun(supervisorRun.id, { status: 'COMPLETED' });
       this.store.appendAgentEvent({ agentRunId: supervisorRun.id, type: 'agent.completed', payload: {
@@ -481,7 +518,10 @@ export class RuntimeExecutor {
         metadata,
         workspacePath: workspace.rootPath,
         resolveCoderOutput: ({ plan, attempt }) =>
-          this.runCoderProvider(task, workspace!, metadata, plan, attempt, stageRuns.get('CODER')),
+          this.runCoderProvider(task, workspace!, metadata, plan, attempt, stageRuns.get('CODER'), undefined, orchestration!, controller.signal, () => {
+            providerRequests += 1;
+            return providerRequests;
+          }),
         resolveDiff: async () => {
           const [diffResult, changedResult] = await Promise.all([
             this.git.diff(workspace!.rootPath),
@@ -501,8 +541,17 @@ export class RuntimeExecutor {
         resolveTestGeneratorOutput: ({ plan, attempt }) => this.runCoderProvider(
           task, workspace!, metadata, plan, attempt, stageRuns.get('TEST_GENERATOR'),
           'TEST_GENERATION: generate focused regression test edits only.',
+          orchestration!, controller.signal, () => {
+            providerRequests += 1;
+            return providerRequests;
+          },
         ),
+        signal: controller.signal,
+        stageTimeoutMs: this.stageTimeoutMs,
+        completedStages,
         onStage: async (event) => {
+          this.throwIfAborted(controller.signal);
+          this.enforceStageBudget(event, orchestration!);
           currentState = await this.handleStage(
             taskId,
             workspace!,
@@ -533,6 +582,12 @@ export class RuntimeExecutor {
               attempt + 1,
               stageRuns.get('REPAIR'),
               failureContext,
+              orchestration!,
+              controller.signal,
+              () => {
+                providerRequests += 1;
+                return providerRequests;
+              },
             );
             await new RepairAgent().applyEdits(workspace!.rootPath, output.edits);
             const observed = await this.collectDiff(workspace!.rootPath);
@@ -540,6 +595,8 @@ export class RuntimeExecutor {
             changedFiles = observed.changedFiles;
           },
           onStage: async (event) => {
+            this.throwIfAborted(controller.signal);
+            this.enforceStageBudget(event, orchestration!);
             currentState = await this.handleStage(
               taskId,
               workspace!,
@@ -613,12 +670,13 @@ export class RuntimeExecutor {
       const failure =
         error instanceof RuntimeExecutorError
           ? error
-          : new RuntimeExecutorError(
-              workspace ? 'PIPELINE_FAILED' : 'WORKSPACE_ERROR',
-              error instanceof Error ? error.message : 'Runtime execution failed',
-            );
-      if (currentState && currentState !== 'FAILED' && currentState !== 'BLOCKED') {
-        currentState = await this.failLifecycle(taskId, currentState);
+          : controller.signal.aborted
+            ? this.abortFailure(error)
+            : this.classifyFailure(error, Boolean(workspace));
+      if (currentState && currentState !== 'FAILED' && currentState !== 'BLOCKED' && currentState !== 'CANCELLED') {
+        currentState = failure.code === 'CANCELLED'
+          ? await this.cancelLifecycle(taskId, currentState)
+          : await this.failLifecycle(taskId, currentState);
       }
       await this.events.emit({
         type: 'agent.failed',
@@ -628,9 +686,39 @@ export class RuntimeExecutor {
       });
       return { ...this.failed(taskId, stages, failure, currentState, workspace, changedFiles, diff, review, tests), orchestration };
     } finally {
+      if (overallTimeout) clearTimeout(overallTimeout);
       if (hasExecutionLock) this.store.releaseTaskExecutionLock(taskId, lockOwner);
       this.activeTasks.delete(taskId);
+      this.activeControllers.delete(taskId);
     }
+  }
+
+  async cancel(taskId: string) {
+    const controller = this.activeControllers.get(taskId);
+    if (controller) {
+      controller.abort(new Error('Runtime execution cancelled'));
+      await this.events.emit({
+        type: 'agent.failed',
+        taskId,
+        at: new Date().toISOString(),
+        payload: { code: 'CANCELLED', error: 'Runtime execution cancelled' },
+      });
+      return true;
+    }
+    const task = this.loadTask(taskId);
+    if (task.status === 'CANCELLED') return true;
+    if (['CREATED', 'QUEUED', 'PLANNING', 'CONTEXT_READY', 'CODING', 'REVIEWING', 'TESTING', 'REPAIRING', 'READY_FOR_APPROVAL'].includes(task.status)) {
+      this.lifecycle.hydrate(taskId, task.status);
+      await this.cancelLifecycle(taskId, task.status);
+      await this.events.emit({
+        type: 'agent.failed',
+        taskId,
+        at: new Date().toISOString(),
+        payload: { code: 'CANCELLED', error: 'Runtime execution cancelled' },
+      });
+      return true;
+    }
+    return false;
   }
 
   private assessRisk(
@@ -733,30 +821,86 @@ export class RuntimeExecutor {
     attempt: number,
     runId?: string,
     repairContext?: string,
+    orchestration?: OrchestrationPlan,
+    signal?: AbortSignal,
+    recordProviderRequest?: () => number,
   ): Promise<CoderModelOutput> {
     if (!this.provider)
       throw new RuntimeExecutorError(
         'PROVIDER_NOT_CONFIGURED',
         'Structured coder provider is not configured',
       );
-    return this.provider.runCoder({
+    this.throwIfAborted(signal);
+    const requestNumber = recordProviderRequest?.() ?? 1;
+    if (orchestration && requestNumber > orchestration.maxProviderRequests) {
+      throw new RuntimeExecutorError(
+        'BUDGET_EXHAUSTED',
+        `Provider request budget exhausted (${requestNumber}/${orchestration.maxProviderRequests})`,
+      );
+    }
+    const providerCall = this.provider.runCoder({
       runId: runId ?? `${task.id}:coder:${attempt}`,
       taskId: task.id,
       workspacePath: workspace.rootPath,
-        role: 'CODER',
-        prompt: [
-          `Task: ${task.prompt}`,
-          `Workspace branch: ${workspace.branch}`,
-          `Project languages: ${metadata.language.join(', ') || 'unknown'}`,
-          `Plan summary: ${plan.summary}`,
-          `Expected behavior: ${plan.expectedBehavior}`,
-          `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
-          repairContext ? `Repair context:\n${repairContext}` : '',
-          await this.buildWorkspaceContext(workspace.rootPath),
-          'Return complete file contents for each changed file as structured edits.',
-          'Only edit files required by the task. Do not modify tests or package metadata unless the task explicitly requires it.',
-        ].join('\n'),
+      role: 'CODER',
+      prompt: [
+        `Task: ${task.prompt}`,
+        `Workspace branch: ${workspace.branch}`,
+        `Project languages: ${metadata.language.join(', ') || 'unknown'}`,
+        `Plan summary: ${plan.summary}`,
+        `Expected behavior: ${plan.expectedBehavior}`,
+        `Verification commands: ${plan.verification.commands.join(', ') || 'none'}`,
+        repairContext ? `Repair context:\n${repairContext}` : '',
+        await this.buildWorkspaceContext(workspace.rootPath),
+        'Return complete file contents for each changed file as structured edits.',
+        'Only edit files required by the task. Do not modify tests or package metadata unless the task explicitly requires it.',
+      ].join('\n'),
     });
+    return this.withAbort(providerCall, signal);
+  }
+
+  private async completedStageResults(
+    taskId: string,
+    workspace: PersistedWorkspace,
+    orchestration: OrchestrationPlan,
+  ): Promise<Partial<Record<PipelineStage, PipelineStageResult>>> {
+    const completed: Partial<Record<PipelineStage, PipelineStageResult>> = {};
+    const runs = this.store.listAgentRuns(taskId);
+    const completedRoles = new Set(
+      runs.filter((run) => run.status === 'COMPLETED').map((run) => run.role),
+    );
+    if (orchestration.strategy === 'TEST_GENERATION' && completedRoles.has('TEST_GENERATOR')) {
+      const observed = await this.collectDiff(workspace.rootPath);
+      completed.TEST_GENERATOR = {
+        modelOutput: { edits: [], explanation: 'Recovered completed TestGenerator stage.' },
+        appliedEdits: [],
+        changedFiles: observed.changedFiles,
+        diff: observed.diff,
+        summary: 'Recovered completed TestGenerator stage.',
+      } satisfies TestGenerationResult;
+    }
+    if (orchestration.strategy === 'SECURITY' && completedRoles.has('SECURITY_REVIEWER')) {
+      const run = runs.find(
+        (candidate) => candidate.role === 'SECURITY_REVIEWER' && candidate.status === 'COMPLETED',
+      );
+      const completedEvent = run
+        ? this.store.listAgentEvents(run.id).find((event) => event.type === 'agent.completed')
+        : undefined;
+      const payload = completedEvent?.payload ?? {};
+      completed.SECURITY_REVIEWER = {
+        verdict: payload.verdict === 'FINDINGS' ? 'FINDINGS' : 'PASSED',
+        findings: Array.isArray(payload.findings)
+          ? (payload.findings as SecurityReviewResult['findings'])
+          : [],
+        affectedFiles: Array.isArray(payload.affectedFiles)
+          ? (payload.affectedFiles as string[])
+          : [],
+        recommendations: Array.isArray(payload.recommendations)
+          ? (payload.recommendations as string[])
+          : [],
+      } satisfies SecurityReviewResult;
+    }
+    return completed;
   }
 
   private async collectDiff(workspacePath: string) {
@@ -842,7 +986,7 @@ export class RuntimeExecutor {
     const agentRunId = stageRuns.get(event.stage);
     if (agentRunId) {
       this.store.updateAgentRun(agentRunId, {
-        status: event.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED',
+        status: event.status === 'COMPLETED' ? 'COMPLETED' : this.agentFailureStatus(event.error),
         error: event.status === 'FAILED' ? event.error : undefined,
       });
       this.store.appendAgentEvent({
@@ -862,16 +1006,21 @@ export class RuntimeExecutor {
 
     if (event.status === 'COMPLETED') {
       this.persistStageResult(taskId, agentRunId, event);
-      if (event.stage === 'PLANNER') return this.transition(taskId, currentState, 'CONTEXT_READY');
+      if (event.stage === 'PLANNER' && this.canTransition(currentState, 'CONTEXT_READY'))
+        return this.transition(taskId, currentState, 'CONTEXT_READY');
     }
     return currentState;
   }
 
   private async transitionForStageStart(taskId: string, current: TaskStatus, stage: PipelineStage) {
-    if (stage === 'CODER') return this.transition(taskId, current, 'CODING');
-    if (stage === 'REVIEWER') return this.transition(taskId, current, 'REVIEWING');
-    if (stage === 'TESTER') return this.transition(taskId, current, 'TESTING');
-    if (stage === 'REPAIR') return this.transition(taskId, current, 'REPAIRING');
+    if (stage === 'CODER' && this.canTransition(current, 'CODING'))
+      return this.transition(taskId, current, 'CODING');
+    if (stage === 'REVIEWER' && this.canTransition(current, 'REVIEWING'))
+      return this.transition(taskId, current, 'REVIEWING');
+    if (stage === 'TESTER' && this.canTransition(current, 'TESTING'))
+      return this.transition(taskId, current, 'TESTING');
+    if (stage === 'REPAIR' && this.canTransition(current, 'REPAIRING'))
+      return this.transition(taskId, current, 'REPAIRING');
     return current;
   }
 
@@ -952,9 +1101,26 @@ export class RuntimeExecutor {
         editPaths: result.appliedEdits.map((edit) => edit.path),
       };
     }
+    if (event.stage === 'TEST_GENERATOR') {
+      const result = event.result as TestGenerationResult;
+      return {
+        summary: result.summary,
+        changedFiles: result.changedFiles,
+        editPaths: result.appliedEdits.map((edit) => edit.path),
+      };
+    }
     if (event.stage === 'REVIEWER') {
       const result = event.result as ReviewerResult;
       return { verdict: result.verdict, findings: result.findings };
+    }
+    if (event.stage === 'SECURITY_REVIEWER') {
+      const result = event.result as SecurityReviewResult;
+      return {
+        verdict: result.verdict,
+        findings: result.findings,
+        affectedFiles: result.affectedFiles,
+        recommendations: result.recommendations,
+      };
     }
     if (event.stage === 'TESTER') {
       const result = event.result as { tests: TestExecution[]; passed: boolean };
@@ -974,6 +1140,83 @@ export class RuntimeExecutor {
   private async transition(taskId: string, current: TaskStatus, target: TaskStatus) {
     if (current === target) return current;
     return this.lifecycle.transition(taskId, target);
+  }
+
+  private canTransition(current: TaskStatus, target: TaskStatus) {
+    return current === target || transitions[current].includes(target);
+  }
+
+  private throwIfAborted(signal?: AbortSignal) {
+    if (!signal?.aborted) return;
+    throw new RuntimeExecutorError(
+      this.isTimeoutReason(signal.reason) ? 'EXECUTION_TIMEOUT' : 'CANCELLED',
+      this.isTimeoutReason(signal.reason)
+        ? 'Runtime execution timed out'
+        : 'Runtime execution cancelled',
+    );
+  }
+
+  private withAbort<T>(operation: Promise<T>, signal?: AbortSignal) {
+    if (!signal) return operation;
+    this.throwIfAborted(signal);
+    return Promise.race([
+      operation,
+      new Promise<never>((_resolve, reject) => {
+        signal.addEventListener(
+          'abort',
+          () =>
+            reject(
+              new RuntimeExecutorError(
+                this.isTimeoutReason(signal.reason) ? 'EXECUTION_TIMEOUT' : 'CANCELLED',
+                this.isTimeoutReason(signal.reason)
+                  ? 'Runtime execution timed out'
+                  : 'Runtime execution cancelled',
+              ),
+            ),
+          { once: true },
+        );
+      }),
+    ]);
+  }
+
+  private isTimeoutReason(reason: unknown) {
+    return reason instanceof Error && /timed out/i.test(reason.message);
+  }
+
+  private classifyFailure(error: unknown, hasWorkspace: boolean) {
+    const message = error instanceof Error ? error.message : 'Runtime execution failed';
+    if (/stage timed out/i.test(message)) return new RuntimeExecutorError('STAGE_TIMEOUT', message);
+    if (/cancelled/i.test(message)) return new RuntimeExecutorError('CANCELLED', message);
+    return new RuntimeExecutorError(hasWorkspace ? 'PIPELINE_FAILED' : 'WORKSPACE_ERROR', message);
+  }
+
+  private abortFailure(error: unknown) {
+    const message = error instanceof Error ? error.message : 'Runtime execution cancelled';
+    return new RuntimeExecutorError(
+      /timed out/i.test(message) ? 'EXECUTION_TIMEOUT' : 'CANCELLED',
+      /timed out/i.test(message) ? 'Runtime execution timed out' : 'Runtime execution cancelled',
+    );
+  }
+
+  private agentFailureStatus(error?: string) {
+    if (/timed out/i.test(error ?? '')) return 'TIMED_OUT' as const;
+    if (/cancelled/i.test(error ?? '')) return 'CANCELLED' as const;
+    return 'FAILED' as const;
+  }
+
+  private enforceStageBudget(event: PipelineStageEvent, orchestration: OrchestrationPlan) {
+    if (event.status !== 'STARTED') return;
+    if (orchestration.maxTotalAttempts < 1)
+      throw new RuntimeExecutorError('BUDGET_EXHAUSTED', 'Agent attempt budget exhausted');
+  }
+
+  private async cancelLifecycle(taskId: string, current: TaskStatus) {
+    if (!this.canTransition(current, 'CANCELLED')) return current;
+    try {
+      return await this.transition(taskId, current, 'CANCELLED');
+    } catch {
+      return current;
+    }
   }
 
   private async failLifecycle(taskId: string, current: TaskStatus) {
@@ -1011,7 +1254,12 @@ export class RuntimeExecutor {
   ): RuntimeExecutionResult {
     return {
       taskId,
-      status: finalState === 'BLOCKED' ? 'BLOCKED' : 'FAILED',
+      status:
+        finalState === 'BLOCKED'
+          ? 'BLOCKED'
+          : finalState === 'CANCELLED'
+            ? 'CANCELLED'
+            : 'FAILED',
       finalState,
       workspace: workspace ? this.publicWorkspace(workspace) : undefined,
       stages,

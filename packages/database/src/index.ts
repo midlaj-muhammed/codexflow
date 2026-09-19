@@ -96,6 +96,10 @@ const migrations = [
     updated_at TEXT NOT NULL
   );
    CREATE INDEX IF NOT EXISTS evaluation_runs_benchmark_task ON evaluation_runs(benchmark_task_id, created_at);`,
+  `ALTER TABLE evaluation_runs ADD COLUMN strategy TEXT;
+   ALTER TABLE evaluation_runs ADD COLUMN planned_stages TEXT NOT NULL DEFAULT '[]';
+   ALTER TABLE evaluation_runs ADD COLUMN executed_stages TEXT NOT NULL DEFAULT '[]';
+   ALTER TABLE evaluation_runs ADD COLUMN specialist_outcomes TEXT NOT NULL DEFAULT '{}';`,
 ];
 
 export type DeliveryStatus =
@@ -191,6 +195,10 @@ export type EvaluationRunRecord = {
   tokenUsage?: number;
   costUsd?: number;
   error?: string;
+  strategy?: string;
+  plannedStages?: string[];
+  executedStages?: Array<{ stage: string; role: string; status: string }>;
+  specialistOutcomes?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
 };
@@ -991,24 +999,29 @@ export class CodexFlowStore {
     const id = randomUUID();
     const timestamp = now();
     this.db.prepare(
-      'INSERT INTO evaluation_runs (id, benchmark_task_id, task_id, repository_commit, provider, model, final_state, technical_success, review_passed, verification_passed, repair_attempts, duration_ms, files_changed, lines_added, lines_removed, token_usage, cost_usd, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO evaluation_runs (id, benchmark_task_id, task_id, repository_commit, provider, model, final_state, technical_success, review_passed, verification_passed, repair_attempts, duration_ms, files_changed, lines_added, lines_removed, token_usage, cost_usd, error, strategy, planned_stages, executed_stages, specialist_outcomes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
     ).run(id, input.benchmarkTaskId, input.taskId ?? null, input.repositoryCommit ?? null, input.provider ?? null,
       input.model ?? null, input.finalState, Number(input.technicalSuccess), input.reviewPassed == null ? null : Number(input.reviewPassed),
       input.verificationPassed == null ? null : Number(input.verificationPassed), input.repairAttempts, input.durationMs,
       input.filesChanged, input.linesAdded, input.linesRemoved, input.tokenUsage ?? null, input.costUsd ?? null,
-      input.error ?? null, timestamp, timestamp);
+      input.error ?? null, input.strategy ?? null, JSON.stringify(input.plannedStages ?? []),
+      JSON.stringify(input.executedStages ?? []), JSON.stringify(input.specialistOutcomes ?? {}),
+      timestamp, timestamp);
     return this.getEvaluationRun(id)!;
   }
   getEvaluationRun(id: string): EvaluationRunRecord | undefined {
     const row = this.db.prepare(
-      'SELECT id, benchmark_task_id AS benchmarkTaskId, task_id AS taskId, repository_commit AS repositoryCommit, provider, model, final_state AS finalState, technical_success AS technicalSuccess, review_passed AS reviewPassed, verification_passed AS verificationPassed, repair_attempts AS repairAttempts, duration_ms AS durationMs, files_changed AS filesChanged, lines_added AS linesAdded, lines_removed AS linesRemoved, token_usage AS tokenUsage, cost_usd AS costUsd, error, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_runs WHERE id = ?',
+      'SELECT id, benchmark_task_id AS benchmarkTaskId, task_id AS taskId, repository_commit AS repositoryCommit, provider, model, final_state AS finalState, technical_success AS technicalSuccess, review_passed AS reviewPassed, verification_passed AS verificationPassed, repair_attempts AS repairAttempts, duration_ms AS durationMs, files_changed AS filesChanged, lines_added AS linesAdded, lines_removed AS linesRemoved, token_usage AS tokenUsage, cost_usd AS costUsd, error, strategy, planned_stages AS plannedStages, executed_stages AS executedStages, specialist_outcomes AS specialistOutcomes, created_at AS createdAt, updated_at AS updatedAt FROM evaluation_runs WHERE id = ?',
     ).get(id) as Record<string, unknown> | undefined;
     if (!row) return undefined;
     return {
       ...row,
-      taskId: optionalString(row.taskId), repositoryCommit: optionalString(row.repositoryCommit), provider: optionalString(row.provider), model: optionalString(row.model), error: optionalString(row.error),
+      taskId: optionalString(row.taskId), repositoryCommit: optionalString(row.repositoryCommit), provider: optionalString(row.provider), model: optionalString(row.model), error: optionalString(row.error), strategy: optionalString(row.strategy),
       technicalSuccess: Boolean(row.technicalSuccess), reviewPassed: row.reviewPassed == null ? undefined : Boolean(row.reviewPassed), verificationPassed: row.verificationPassed == null ? undefined : Boolean(row.verificationPassed),
       repairAttempts: Number(row.repairAttempts), durationMs: Number(row.durationMs), filesChanged: Number(row.filesChanged), linesAdded: Number(row.linesAdded), linesRemoved: Number(row.linesRemoved), tokenUsage: row.tokenUsage == null ? undefined : Number(row.tokenUsage), costUsd: row.costUsd == null ? undefined : Number(row.costUsd),
+      plannedStages: JSON.parse(String(row.plannedStages ?? '[]')) as string[],
+      executedStages: JSON.parse(String(row.executedStages ?? '[]')) as Array<{ stage: string; role: string; status: string }>,
+      specialistOutcomes: JSON.parse(String(row.specialistOutcomes ?? '{}')) as Record<string, string>,
     } as EvaluationRunRecord;
   }
   listEvaluationRuns(benchmarkTaskId?: string): EvaluationRunRecord[] {

@@ -31,7 +31,7 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 6,
+      count: 7,
     });
   });
   it('persists fingerprint-bound approvals through the existing approvals table', () => {

@@ -88,6 +88,16 @@ export class EvaluationRunner {
       : undefined;
     const reviewPassed = result.review?.verdict === 'APPROVED';
     const stats = diffStats(result.diff);
+    const executedStages = result.stages.map((stage) => ({
+      stage: stage.stage,
+      role: stage.role,
+      status: stage.status,
+    }));
+    const specialistOutcomes = Object.fromEntries(
+      executedStages
+        .filter((stage) => ['SECURITY_REVIEWER', 'TEST_GENERATOR'].includes(stage.role))
+        .map((stage) => [stage.role, stage.status]),
+    );
     return this.store.createEvaluationRun({
       benchmarkTaskId: benchmarkTask.id,
       taskId: preparation.taskId,
@@ -104,6 +114,10 @@ export class EvaluationRunner {
       linesAdded: stats.linesAdded,
       linesRemoved: stats.linesRemoved,
       error: result.error?.message,
+      strategy: result.orchestration?.strategy,
+      plannedStages: [...(result.orchestration?.stages ?? [])],
+      executedStages,
+      specialistOutcomes,
     });
   }
 }

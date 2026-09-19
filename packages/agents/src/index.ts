@@ -479,7 +479,7 @@ export class OrchestrationSupervisor {
       ? 'SECURITY'
       : /refactor|rename|restructure/.test(prompt)
         ? 'REFACTOR'
-        : /test|coverage|spec/.test(prompt)
+        : /(add|create|generate|write).{0,32}(test|tests|coverage|spec|specs)|regression coverage/.test(prompt)
           ? 'TEST_GENERATION'
           : 'BUG_FIX';
     const verification = strategy === 'SECURITY' || strategy === 'REFACTOR'
@@ -532,6 +532,7 @@ export type CoderOutputResolver = (input: {
   workspacePath: string;
   plan: PlannerResult;
   attempt: number;
+  signal?: AbortSignal;
 }) => Promise<CoderModelOutput> | CoderModelOutput;
 export type DiffResolver = (input: CoderStageResult) => Promise<{
   diff: string;
@@ -562,16 +563,36 @@ export class CoreAgentPipeline {
     runSecurityReviewer?: boolean;
     runTestGenerator?: boolean;
     resolveTestGeneratorOutput?: CoderOutputResolver;
+    signal?: AbortSignal;
+    stageTimeoutMs?: number;
+    completedStages?: Partial<Record<PipelineStage, PipelineStageResult>>;
   }) {
     const emit = (event: PendingPipelineStageEvent) =>
       input.onStage?.({ ...event, at: new Date().toISOString() } as PipelineStageEvent);
     const runStage = async <T extends PipelineStageResult>(
       stage: PipelineStage,
-      operation: () => Promise<T> | T,
+      operation: (signal: AbortSignal) => Promise<T> | T,
     ) => {
+      const completed = input.completedStages?.[stage] as T | undefined;
+      if (completed) return completed;
+      if (input.signal?.aborted) throw new Error('Runtime execution cancelled');
+      const stageController = new AbortController();
+      const abortStage = () => stageController.abort();
+      input.signal?.addEventListener('abort', abortStage, { once: true });
       await emit({ stage, status: 'STARTED' });
+      let timeout: ReturnType<typeof setTimeout> | undefined;
       try {
-        const result = await operation();
+        const result = input.stageTimeoutMs
+          ? await Promise.race([
+              Promise.resolve(operation(stageController.signal)),
+              new Promise<never>((_resolve, reject) => {
+                timeout = setTimeout(() => {
+                  stageController.abort();
+                  reject(new Error(`${stage} stage timed out after ${input.stageTimeoutMs}ms`));
+                }, input.stageTimeoutMs);
+              }),
+            ])
+          : await operation(stageController.signal);
         await emit({ stage, status: 'COMPLETED', result });
         return result;
       } catch (error) {
@@ -581,12 +602,15 @@ export class CoreAgentPipeline {
           error: error instanceof Error ? error.message : `${stage} stage failed`,
         });
         throw error;
+      } finally {
+        if (timeout) clearTimeout(timeout);
+        input.signal?.removeEventListener('abort', abortStage);
       }
     };
     const plan = await runStage('PLANNER', () =>
       this.planner.plan({ prompt: input.prompt, metadata: input.metadata }),
     );
-    const codeStage = await runStage('CODER', async () => {
+    const codeStage = await runStage('CODER', async (signal) => {
       const modelOutput = input.resolveCoderOutput
         ? coderModelOutputSchema.parse(
             await input.resolveCoderOutput({
@@ -595,6 +619,7 @@ export class CoreAgentPipeline {
               workspacePath: input.workspacePath,
               plan,
               attempt: input.attempt ?? 1,
+              signal,
             }),
           )
         : coderModelOutputSchema.parse(JSON.parse(input.modelOutput ?? ''));
@@ -616,11 +641,11 @@ export class CoreAgentPipeline {
     let effectiveChangedFiles = codeStage.changedFiles;
     let effectiveDiff = codeStage.diff ?? input.diff;
     if (input.runTestGenerator) {
-      const generated = await runStage('TEST_GENERATOR', async () => {
+      const generated = await runStage('TEST_GENERATOR', async (signal) => {
         if (!input.resolveTestGeneratorOutput) throw new Error('TestGenerator provider is not configured');
         const modelOutput = coderModelOutputSchema.parse(await input.resolveTestGeneratorOutput({
           prompt: `${input.prompt}\n\nStrategy: TEST_GENERATION. Add focused regression tests only; do not modify credentials or files outside the workspace.`,
-          metadata: input.metadata, workspacePath: input.workspacePath, plan, attempt: input.attempt ?? 1,
+          metadata: input.metadata, workspacePath: input.workspacePath, plan, attempt: input.attempt ?? 1, signal,
         }));
         const code = await new TestGeneratorAgent().applyEdits(input.workspacePath, modelOutput.edits);
         const observed = input.resolveDiff ? await input.resolveDiff({ modelOutput, appliedEdits: modelOutput.edits, changedFiles: code.changedFiles }) : { diff: effectiveDiff, changedFiles: code.changedFiles };
@@ -641,8 +666,8 @@ export class CoreAgentPipeline {
           diff: effectiveDiff,
         }))
       : undefined;
-    const testStage = await runStage('TESTER', async () => {
-      const tests = await this.tester.verify(input.workspacePath, plan.verification);
+    const testStage = await runStage('TESTER', async (signal) => {
+      const tests = await this.tester.verify(input.workspacePath, plan.verification, signal);
       return { tests, passed: tests.every((test) => test.status === 'PASSED') };
     });
     const tests = testStage.tests;
@@ -867,10 +892,10 @@ export class TesterAgent {
   constructor(private readonly timeoutMs = 60_000) {
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Tester timeout must be positive');
   }
-  async verify(workspacePath: string, plan: VerificationPlan): Promise<TestExecution[]> {
-    return Promise.all(plan.commands.map((command) => this.execute(workspacePath, command)));
+  async verify(workspacePath: string, plan: VerificationPlan, signal?: AbortSignal): Promise<TestExecution[]> {
+    return Promise.all(plan.commands.map((command) => this.execute(workspacePath, command, signal)));
   }
-  private async execute(cwd: string, command: string): Promise<TestExecution> {
+  private async execute(cwd: string, command: string, signal?: AbortSignal): Promise<TestExecution> {
     if (prohibited.test(command)) throw new Error(`Command denied by policy: ${command}`);
     const started = Date.now();
     try {
@@ -878,6 +903,7 @@ export class TesterAgent {
         cwd,
         maxBuffer: 10_000_000,
         timeout: this.timeoutMs,
+        signal,
       });
       return {
         command,
@@ -888,7 +914,8 @@ export class TesterAgent {
         status: 'PASSED',
       };
     } catch (error) {
-      const result = error as { code?: number; stdout?: string; stderr?: string };
+      const result = error as { code?: number; stdout?: string; stderr?: string; name?: string };
+      if (result.name === 'AbortError') throw new Error('Tester stage cancelled');
       return {
         command,
         exitCode: typeof result.code === 'number' ? result.code : null,
