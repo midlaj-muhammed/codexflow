@@ -1,25 +1,73 @@
-import type { TaskStatus } from '@codexflow/shared';
+import type { AgentRole, TaskStatus } from '@codexflow/shared';
+
+export type Permission = 'READ' | 'WRITE' | 'EXECUTE' | 'CONTROL';
+export type RuntimeEventType =
+  | 'task.created'
+  | 'task.started'
+  | 'workspace.created'
+  | 'workspace.ready'
+  | 'agent.started'
+  | 'agent.progress'
+  | 'agent.completed'
+  | 'agent.failed'
+  | 'plan.created'
+  | 'code.generated'
+  | 'review.started'
+  | 'review.completed'
+  | 'test.started'
+  | 'test.completed'
+  | 'repair.started'
+  | 'repair.completed'
+  | 'approval.required'
+  | 'task.approved'
+  | 'task.rejected'
+  | 'commit.created'
+  | 'branch.pushed'
+  | 'pull_request.created'
+  | 'evaluation.completed';
 export type RuntimeEvent = {
-  type: string;
+  type: RuntimeEventType;
   taskId: string;
   at: string;
   payload?: Record<string, unknown>;
 };
+export type RuntimeCommandType =
+  | 'createTask'
+  | 'startTask'
+  | 'createWorkspace'
+  | 'runAgent'
+  | 'cancelAgent'
+  | 'approveTask'
+  | 'rejectTask'
+  | 'rollbackTask'
+  | 'commitChanges'
+  | 'pushBranch'
+  | 'createPullRequest';
 export type RuntimeCommand = {
-  type:
-    | 'createTask'
-    | 'createWorkspace'
-    | 'runAgent'
-    | 'cancelAgent'
-    | 'approveTask'
-    | 'rejectTask'
-    | 'rollbackTask'
-    | 'commitChanges'
-    | 'pushBranch'
-    | 'createPullRequest';
+  type: RuntimeCommandType;
   taskId: string;
   payload?: Record<string, unknown>;
 };
+export type ExecutionContext = {
+  taskId: string;
+  workspaceId?: string;
+  workspacePath?: string;
+  role: AgentRole;
+  permissions: readonly Permission[];
+  attempt: number;
+  signal: AbortSignal;
+};
+export type AgentPlugin = {
+  id: string;
+  role: AgentRole;
+  permissions: readonly Permission[];
+  run(context: ExecutionContext): Promise<void>;
+};
+export interface RuntimePersistence {
+  saveTaskState(taskId: string, status: TaskStatus): void | Promise<void>;
+  appendEvent(event: RuntimeEvent): void | Promise<void>;
+}
+
 const transitions: Record<TaskStatus, TaskStatus[]> = {
   CREATED: ['QUEUED', 'CANCELLED'],
   QUEUED: ['PLANNING', 'CANCELLED'],
@@ -38,10 +86,12 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
   CANCELLED: [],
   BLOCKED: [],
 };
-export class TaskLifecycle {
+export class TaskLifecycleManager {
   private states = new Map<string, TaskStatus>();
-  create(taskId: string) {
+  constructor(private readonly persistence?: RuntimePersistence) {}
+  async create(taskId: string) {
     this.states.set(taskId, 'CREATED');
+    await this.persistence?.saveTaskState(taskId, 'CREATED');
     return 'CREATED' as const;
   }
   get(taskId: string) {
@@ -49,74 +99,125 @@ export class TaskLifecycle {
     if (!state) throw new Error(`Unknown task: ${taskId}`);
     return state;
   }
-  transition(taskId: string, target: TaskStatus) {
+  async transition(taskId: string, target: TaskStatus) {
     const current = this.get(taskId);
     if (!transitions[current].includes(target))
       throw new Error(`Invalid task transition: ${current} → ${target}`);
     this.states.set(taskId, target);
+    await this.persistence?.saveTaskState(taskId, target);
     return target;
   }
 }
 export class EventBus {
-  private listeners = new Set<(event: RuntimeEvent) => void>();
-  subscribe(listener: (event: RuntimeEvent) => void) {
+  private listeners = new Set<(event: RuntimeEvent) => void | Promise<void>>();
+  constructor(private readonly persistence?: RuntimePersistence) {}
+  subscribe(listener: (event: RuntimeEvent) => void | Promise<void>) {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
   }
-  emit(event: RuntimeEvent) {
-    this.listeners.forEach((listener) => listener(event));
+  async emit(event: RuntimeEvent) {
+    await this.persistence?.appendEvent(event);
+    await Promise.all([...this.listeners].map((listener) => listener(event)));
   }
 }
 export class PluginRegistry {
-  private plugins = new Map<string, { id: string; roles: string[] }>();
-  register(plugin: { id: string; roles: string[] }) {
-    this.plugins.set(plugin.id, plugin);
+  private plugins = new Map<AgentRole, AgentPlugin>();
+  register(plugin: AgentPlugin) {
+    if (this.plugins.has(plugin.role))
+      throw new Error(`Plugin already registered for ${plugin.role}`);
+    this.plugins.set(plugin.role, plugin);
   }
-  get(id: string) {
-    return this.plugins.get(id);
+  get(role: AgentRole) {
+    const plugin = this.plugins.get(role);
+    if (!plugin) throw new Error(`No plugin registered for ${role}`);
+    return plugin;
+  }
+  list() {
+    return [...this.plugins.values()];
+  }
+}
+export class AgentLifecycleManager {
+  private controllers = new Map<string, AbortController>();
+  async run(plugin: AgentPlugin, context: Omit<ExecutionContext, 'signal'>) {
+    const controller = new AbortController();
+    this.controllers.set(`${context.taskId}:${context.role}`, controller);
+    try {
+      await plugin.run({ ...context, signal: controller.signal });
+    } finally {
+      this.controllers.delete(`${context.taskId}:${context.role}`);
+    }
+  }
+  cancel(taskId: string, role: AgentRole) {
+    const controller = this.controllers.get(`${taskId}:${role}`);
+    if (!controller) return false;
+    controller.abort();
+    return true;
+  }
+}
+export class Scheduler {
+  constructor(private readonly agents: AgentLifecycleManager) {}
+  schedule(plugin: AgentPlugin, context: Omit<ExecutionContext, 'signal'>) {
+    return this.agents.run(plugin, context);
   }
 }
 export class CommandBus {
   constructor(
-    private readonly lifecycle: TaskLifecycle,
+    private readonly lifecycle: TaskLifecycleManager,
     private readonly events: EventBus,
   ) {}
-  dispatch(command: RuntimeCommand) {
+  async dispatch(command: RuntimeCommand) {
     if (command.type === 'createTask') {
-      this.lifecycle.create(command.taskId);
-      this.publish('task.created', command.taskId);
-      return;
+      await this.lifecycle.create(command.taskId);
+      return this.publish('task.created', command.taskId);
     }
-    const target: Partial<Record<RuntimeCommand['type'], TaskStatus>> = {
+    const states: Partial<Record<RuntimeCommandType, TaskStatus>> = {
+      startTask: 'QUEUED',
       approveTask: 'APPROVED',
       rejectTask: 'REJECTED',
       rollbackTask: 'ROLLED_BACK',
     };
-    if (target[command.type]) this.lifecycle.transition(command.taskId, target[command.type]!);
-    this.publish(command.type, command.taskId, command.payload);
+    const eventTypes: Partial<Record<RuntimeCommandType, RuntimeEventType>> = {
+      startTask: 'task.started',
+      createWorkspace: 'workspace.created',
+      runAgent: 'agent.started',
+      cancelAgent: 'agent.failed',
+      approveTask: 'task.approved',
+      rejectTask: 'task.rejected',
+      commitChanges: 'commit.created',
+      pushBranch: 'branch.pushed',
+      createPullRequest: 'pull_request.created',
+    };
+    if (states[command.type])
+      await this.lifecycle.transition(command.taskId, states[command.type]!);
+    if (!eventTypes[command.type]) throw new Error(`Unsupported command: ${command.type}`);
+    await this.publish(eventTypes[command.type]!, command.taskId, command.payload);
   }
-  private publish(type: string, taskId: string, payload?: Record<string, unknown>) {
-    this.events.emit({ type, taskId, payload, at: new Date().toISOString() });
+  private publish(type: RuntimeEventType, taskId: string, payload?: Record<string, unknown>) {
+    return this.events.emit({ type, taskId, payload, at: new Date().toISOString() });
   }
 }
 export async function runMockWorkflow(taskId: string) {
-  const lifecycle = new TaskLifecycle();
+  const lifecycle = new TaskLifecycleManager();
   const events = new EventBus();
   const timeline: RuntimeEvent[] = [];
-  events.subscribe((event) => timeline.push(event));
-  const command = new CommandBus(lifecycle, events);
-  command.dispatch({ type: 'createTask', taskId });
-  for (const [status, event] of [
-    ['QUEUED', 'task.started'],
+  events.subscribe((event) => {
+    timeline.push(event);
+  });
+  const commands = new CommandBus(lifecycle, events);
+  await commands.dispatch({ type: 'createTask', taskId });
+  await commands.dispatch({ type: 'startTask', taskId });
+  for (const [state, event] of [
     ['PLANNING', 'agent.started'],
     ['CONTEXT_READY', 'plan.created'],
     ['CODING', 'workspace.ready'],
     ['REVIEWING', 'code.generated'],
     ['TESTING', 'review.completed'],
     ['READY_FOR_APPROVAL', 'test.completed'],
-  ] as [TaskStatus, string][]) {
-    lifecycle.transition(taskId, status);
-    events.emit({ type: event, taskId, at: new Date().toISOString() });
+  ] as [TaskStatus, RuntimeEventType][]) {
+    await lifecycle.transition(taskId, state);
+    await events.emit({ type: event, taskId, at: new Date().toISOString() });
   }
+  await events.emit({ type: 'approval.required', taskId, at: new Date().toISOString() });
   return { status: lifecycle.get(taskId), timeline };
 }
+export { TaskLifecycleManager as TaskLifecycle };
