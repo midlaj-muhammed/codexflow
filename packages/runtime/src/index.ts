@@ -347,6 +347,8 @@ const stageRoles: Record<PipelineStage, AgentRole> = {
   PLANNER: 'PLANNER',
   CODER: 'CODER',
   REVIEWER: 'REVIEWER',
+  SECURITY_REVIEWER: 'SECURITY_REVIEWER',
+  TEST_GENERATOR: 'TEST_GENERATOR',
   TESTER: 'TESTER',
   REPAIR: 'REPAIR',
 };
@@ -494,6 +496,12 @@ export class RuntimeExecutor {
         },
         diff,
         changedFiles,
+        runSecurityReviewer: orchestration.strategy === 'SECURITY',
+        runTestGenerator: orchestration.strategy === 'TEST_GENERATION',
+        resolveTestGeneratorOutput: ({ plan, attempt }) => this.runCoderProvider(
+          task, workspace!, metadata, plan, attempt, stageRuns.get('TEST_GENERATOR'),
+          'TEST_GENERATION: generate focused regression test edits only.',
+        ),
         onStage: async (event) => {
           currentState = await this.handleStage(
             taskId,

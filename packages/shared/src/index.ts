@@ -27,6 +27,8 @@ export const agentRoleSchema = z.enum([
   'REVIEWER',
   'TESTER',
   'REPAIR',
+  'SECURITY_REVIEWER',
+  'TEST_GENERATOR',
   'REPORTER',
   'SUPERVISOR',
   'INTEGRATION',

@@ -402,6 +402,14 @@ export class ReviewerAgent {
     };
   }
 }
+export type SecurityReviewResult = { verdict: 'PASSED' | 'FINDINGS'; findings: ReviewFinding[]; affectedFiles: string[]; recommendations: string[] };
+/** Read-only specialist: it examines the actual diff and never writes the workspace. */
+export class SecurityReviewerAgent {
+  review(input: { changedFiles: string[]; diff: string }): SecurityReviewResult {
+    const findings = new ReviewerAgent().review(input).findings.filter((finding) => finding.severity === 'HIGH');
+    return { verdict: findings.length ? 'FINDINGS' : 'PASSED', findings, affectedFiles: input.changedFiles, recommendations: findings.map((finding) => finding.message) };
+  }
+}
 export type FileEdit = { path: string; content: string };
 export type CoderResult = { changedFiles: string[] };
 export class CoderAgent {
@@ -426,6 +434,8 @@ export class CoderAgent {
   }
 }
 export class RepairAgent extends CoderAgent {}
+/** Test generation deliberately reuses CoderAgent's validated workspace-edit boundary. */
+export class TestGeneratorAgent extends CoderAgent {}
 export class SupervisorAgent {
   constructor(private readonly maxRepairs = 2) {}
   nextAfterVerification(
@@ -484,13 +494,14 @@ export class OrchestrationSupervisor {
     };
   }
 }
-export type PipelineStage = 'PLANNER' | 'CODER' | 'REVIEWER' | 'TESTER' | 'REPAIR';
+export type PipelineStage = 'PLANNER' | 'CODER' | 'TEST_GENERATOR' | 'REVIEWER' | 'SECURITY_REVIEWER' | 'TESTER' | 'REPAIR';
 export type CoderStageResult = {
   modelOutput: CoderModelOutput;
   appliedEdits: FileEdit[];
   changedFiles: string[];
   diff?: string;
 };
+export type TestGenerationResult = CoderStageResult & { summary: string };
 export type TesterStageResult = {
   tests: TestExecution[];
   passed: boolean;
@@ -501,7 +512,9 @@ export type RepairStageResult = {
 export type PipelineStageResult =
   | PlannerResult
   | CoderStageResult
+  | TestGenerationResult
   | ReviewerResult
+  | SecurityReviewResult
   | TesterStageResult
   | RepairStageResult;
 export type PipelineStageEvent =
@@ -546,6 +559,9 @@ export class CoreAgentPipeline {
     changedFiles: string[];
     attempt?: number;
     onStage?: PipelineStageObserver;
+    runSecurityReviewer?: boolean;
+    runTestGenerator?: boolean;
+    resolveTestGeneratorOutput?: CoderOutputResolver;
   }) {
     const emit = (event: PendingPipelineStageEvent) =>
       input.onStage?.({ ...event, at: new Date().toISOString() } as PipelineStageEvent);
@@ -597,25 +613,48 @@ export class CoreAgentPipeline {
         diff: observed.diff,
       };
     });
+    let effectiveChangedFiles = codeStage.changedFiles;
+    let effectiveDiff = codeStage.diff ?? input.diff;
+    if (input.runTestGenerator) {
+      const generated = await runStage('TEST_GENERATOR', async () => {
+        if (!input.resolveTestGeneratorOutput) throw new Error('TestGenerator provider is not configured');
+        const modelOutput = coderModelOutputSchema.parse(await input.resolveTestGeneratorOutput({
+          prompt: `${input.prompt}\n\nStrategy: TEST_GENERATION. Add focused regression tests only; do not modify credentials or files outside the workspace.`,
+          metadata: input.metadata, workspacePath: input.workspacePath, plan, attempt: input.attempt ?? 1,
+        }));
+        const code = await new TestGeneratorAgent().applyEdits(input.workspacePath, modelOutput.edits);
+        const observed = input.resolveDiff ? await input.resolveDiff({ modelOutput, appliedEdits: modelOutput.edits, changedFiles: code.changedFiles }) : { diff: effectiveDiff, changedFiles: code.changedFiles };
+        return { modelOutput, appliedEdits: modelOutput.edits, changedFiles: observed.changedFiles.length ? observed.changedFiles : code.changedFiles, diff: observed.diff, summary: modelOutput.explanation ?? 'Generated focused tests.' };
+      });
+      effectiveChangedFiles = [...new Set([...effectiveChangedFiles, ...generated.changedFiles])];
+      effectiveDiff = generated.diff ?? effectiveDiff;
+    }
     const review = await runStage('REVIEWER', () =>
       this.reviewer.review({
-        changedFiles: input.changedFiles.length ? input.changedFiles : codeStage.changedFiles,
-        diff: codeStage.diff ?? input.diff,
+        changedFiles: effectiveChangedFiles,
+        diff: effectiveDiff,
       }),
     );
+    const security = input.runSecurityReviewer
+      ? await runStage('SECURITY_REVIEWER', () => new SecurityReviewerAgent().review({
+          changedFiles: effectiveChangedFiles,
+          diff: effectiveDiff,
+        }))
+      : undefined;
     const testStage = await runStage('TESTER', async () => {
       const tests = await this.tester.verify(input.workspacePath, plan.verification);
       return { tests, passed: tests.every((test) => test.status === 'PASSED') };
     });
     const tests = testStage.tests;
-    const passed = review.verdict === 'APPROVED' && tests.every((test) => test.status === 'PASSED');
+    const passed = review.verdict === 'APPROVED' && security?.verdict !== 'FINDINGS' && tests.every((test) => test.status === 'PASSED');
     return {
       plan,
       code: {
-        changedFiles: codeStage.changedFiles,
-        diff: codeStage.diff,
+        changedFiles: effectiveChangedFiles,
+        diff: effectiveDiff,
       },
       review,
+      security,
       tests,
       next: this.supervisor.nextAfterVerification(input.attempt ?? 1, passed),
     };

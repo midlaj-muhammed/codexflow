@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,6 +11,7 @@ import {
   OrchestrationSupervisor,
   PlannerAgent,
   ReviewerAgent,
+  SecurityReviewerAgent,
   RiskEngine,
   SupervisorAgent,
   TesterAgent,
@@ -414,5 +415,26 @@ describe('scanner and mock provider', () => {
     expect(supervisor.select({ prompt: 'Refactor parser names', metadata }).strategy).toBe('REFACTOR');
     expect(supervisor.select({ prompt: 'Add regression coverage', metadata }).strategy).toBe('TEST_GENERATION');
     expect(supervisor.select({ prompt: 'Fix the parser bug', metadata }).strategy).toBe('BUG_FIX');
+  });
+  it('runs the read-only security specialist against the actual diff', () => {
+    const reviewer = new SecurityReviewerAgent();
+    expect(reviewer.review({ changedFiles: ['src/a.ts'], diff: '+const ok = true;' })).toMatchObject({ verdict: 'PASSED' });
+    expect(reviewer.review({ changedFiles: ['.env'], diff: '+TOKEN=value' })).toMatchObject({ verdict: 'FINDINGS' });
+  });
+  it('runs TestGenerator before review and verification through the safe edit path', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'test-generator-'));
+    writeFileSync(join(root, 'code.txt'), 'code');
+    const stages: string[] = [];
+    const result = await new CoreAgentPipeline().run({
+      prompt: 'Add regression test coverage', metadata: { language: [], sourceDirectories: [], testDirectories: [], configFiles: [], testCommand: 'test -f generated.test.txt' }, workspacePath: root,
+      resolveCoderOutput: async () => ({ edits: [{ path: 'code.txt', content: 'changed' }] }),
+      runTestGenerator: true,
+      resolveTestGeneratorOutput: async () => ({ edits: [{ path: 'generated.test.txt', content: 'coverage' }], explanation: 'test fixture' }),
+      resolveDiff: async (stage) => ({ diff: stage.changedFiles.join('\n'), changedFiles: stage.changedFiles }), diff: '', changedFiles: [],
+      onStage: (event) => { if (event.status === 'STARTED') stages.push(event.stage); },
+    });
+    expect(readFileSync(join(root, 'generated.test.txt'), 'utf8')).toBe('coverage');
+    expect(stages).toEqual(['PLANNER', 'CODER', 'TEST_GENERATOR', 'REVIEWER', 'TESTER']);
+    expect(result.tests).toEqual([expect.objectContaining({ status: 'PASSED' })]);
   });
 });
