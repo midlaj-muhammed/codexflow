@@ -211,4 +211,23 @@ export function evaluationSnapshot() {
   })), starter, runs, metrics: calculateEvaluationMetrics(runs) };
 }
 
+/** Derived solely from persisted runtime state; no synthetic operational metrics. */
+export function operationsSnapshot() {
+  const { store } = controlPlane();
+  const reclaimedStaleLeases = store.releaseExpiredTaskExecutionLocks();
+  const tasks = store.listTasks();
+  const agentRuns = tasks.flatMap((task) => store.listAgentRuns(String(task.id)));
+  const taskStates = tasks.reduce<Record<string, number>>((counts, task) => {
+    const status = String(task.status);
+    counts[status] = (counts[status] ?? 0) + 1;
+    return counts;
+  }, {});
+  return {
+    generatedAt: new Date().toISOString(),
+    tasks: { total: tasks.length, byState: taskStates, failed: tasks.filter((task) => ['FAILED', 'BLOCKED', 'CANCELLED'].includes(String(task.status))).length },
+    agents: { total: agentRuns.length, failed: agentRuns.filter((run) => ['FAILED', 'TIMED_OUT', 'CANCELLED'].includes(String(run.status))).length },
+    execution: { activeLeases: store.listTaskExecutionLocks().length, reclaimedStaleLeases },
+  };
+}
+
 export type ScanMetadata = ProjectMetadata;

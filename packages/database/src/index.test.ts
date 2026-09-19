@@ -188,6 +188,9 @@ describe('CodexFlowStore', () => {
     expect(store.getTaskExecutionLock(String(task.id))).toMatchObject({ ownerId: 'runtime-a' });
     store.releaseTaskExecutionLock(String(task.id), 'runtime-a');
     expect(store.acquireTaskExecutionLock(String(task.id), 'runtime-b', 1_000)).toBe(true);
+    expect(store.listTaskExecutionLocks()).toHaveLength(1);
+    expect(store.releaseExpiredTaskExecutionLocks(new Date(Date.now() + 2_000).toISOString())).toBe(1);
+    expect(store.listTaskExecutionLocks()).toHaveLength(0);
   });
   it('persists versioned benchmarks, tasks, and reproducible evaluation results', () => {
     const store = new CodexFlowStore(openDatabase());

@@ -18,6 +18,7 @@ type TaskDetail = {
   delivery: { commit?: Json; pushes: Json[]; pullRequests: Json[] };
 };
 type EvaluationSummary = { benchmarks: Array<Json & { taskCount: number }>; runs: Json[]; metrics: Json };
+type Operations = { tasks: { total: number; failed: number; byState: Json }; agents: { total: number; failed: number }; execution: { activeLeases: number; reclaimedStaleLeases: number } };
 
 const statusClass = (value: unknown) => `status status-${String(value ?? 'UNKNOWN').toLowerCase()}`;
 const text = (value: unknown, fallback = 'Not available') =>
@@ -83,6 +84,7 @@ export function ControlPlane() {
   const [projects, setProjects] = useState<Json[]>([]);
   const [tasks, setTasks] = useState<Json[]>([]);
   const [evaluation, setEvaluation] = useState<EvaluationSummary>();
+  const [operations, setOperations] = useState<Operations>();
   const [detail, setDetail] = useState<TaskDetail>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -91,16 +93,18 @@ export function ControlPlane() {
   const refresh = useCallback(async () => {
     try {
       setError(undefined);
-      const [repoResult, projectResult, taskResult, evaluationResult] = await Promise.all([
+      const [repoResult, projectResult, taskResult, evaluationResult, operationsResult] = await Promise.all([
         request<{ repositories: Json[] }>('/api/repositories'),
         request<{ projects: Json[] }>('/api/projects'),
         request<{ tasks: Json[] }>('/api/tasks'),
         request<EvaluationSummary>('/api/evaluations'),
+        request<{ operations: Operations }>('/api/operations'),
       ]);
       setRepositories(repoResult.repositories);
       setProjects(projectResult.projects);
       setTasks(taskResult.tasks);
       setEvaluation(evaluationResult);
+      setOperations(operationsResult.operations);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load control-plane data'); }
   }, []);
   useEffect(() => {
@@ -146,6 +150,7 @@ export function ControlPlane() {
     <section className="card" id="projects"><h2>Projects & repository status</h2>{repositories.length ? <div className="table">{repositories.map((repo) => <div className="row" key={String(repo.id)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.defaultBranch)} · {String((repo.git as Json | undefined)?.status ?? 'UNKNOWN')}</small></div><div>{projects.filter((project) => project.repositoryId === repo.id).map((project) => <span className="tag" key={String(project.id)}>{String(project.name)}</span>)}</div></div>)}</div> : <Empty>No repository has been imported.</Empty>}</section>
     <section className="card" id="tasks"><h2>Tasks</h2>{tasks.length ? <div className="table">{tasks.map((task) => <button className="row task-row" onClick={() => void openTask(String(task.id))} key={String(task.id)}><div><strong>{String(task.prompt)}</strong><small>{String(task.createdAt)}</small></div><span className={statusClass(task.deliveryStatus ?? task.status)}>{String(task.deliveryStatus ?? task.status)}</span></button>)}</div> : <Empty>No tasks yet. Create one to start a persisted lifecycle.</Empty>}</section>
     <section className="card" id="evaluation"><h2>Evaluation benchmarks</h2>{evaluation ? <><p className="subtle">{evaluation.benchmarks.reduce((count, benchmark) => count + Number(benchmark.taskCount), 0)} controlled tasks · {evaluation.runs.length} persisted runs</p><div className="metrics"><div><strong>{String(evaluation.metrics.finalTaskSuccessRate ?? '—')}</strong><span>technical success</span></div><div><strong>{String(evaluation.metrics.repairRate ?? '—')}</strong><span>repair rate</span></div><div><strong>{String(evaluation.metrics.blockedRate ?? '—')}</strong><span>blocked rate</span></div></div><ul className="runs">{evaluation.benchmarks.map((benchmark) => <li key={String(benchmark.id)}><strong>{String(benchmark.name)}</strong><small>v{String(benchmark.version)} · {String(benchmark.taskCount)} tasks</small></li>)}</ul></> : <Empty>Loading persisted benchmark records.</Empty>}</section>
+    <section className="card"><h2>Operations</h2>{operations ? <div className="metrics"><div><strong>{operations.tasks.total}</strong><span>persisted tasks</span></div><div><strong>{operations.agents.failed}</strong><span>agent failures</span></div><div><strong>{operations.execution.activeLeases}</strong><span>active leases</span></div><div><strong>{operations.tasks.failed}</strong><span>blocked/failed tasks</span></div></div> : <Empty>Loading persisted operational state.</Empty>}</section>
   <div id="delivery">{detail ? <Detail detail={detail} onUpdate={(task) => { setDetail(task); void refresh(); }} onError={setError} /> : <section className="card"><h2>Agent run</h2><Empty>Select a task to inspect its plan, agents, verification, risk, approval, delivery, and evaluation records.</Empty></section>}</div>
   </main>;
 }

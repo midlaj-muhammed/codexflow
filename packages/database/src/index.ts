@@ -442,6 +442,16 @@ export class CodexFlowStore {
       .prepare('SELECT task_id AS taskId, owner_id AS ownerId, acquired_at AS acquiredAt, expires_at AS expiresAt FROM task_execution_locks WHERE task_id = ?')
       .get(taskId) as Record<string, unknown> | undefined;
   }
+  listTaskExecutionLocks() {
+    return this.db
+      .prepare('SELECT task_id AS taskId, owner_id AS ownerId, acquired_at AS acquiredAt, expires_at AS expiresAt FROM task_execution_locks ORDER BY acquired_at ASC')
+      .all() as Record<string, unknown>[];
+  }
+  /** Reclaims only expired leases; active work ownership is never removed. */
+  releaseExpiredTaskExecutionLocks(referenceTime = new Date().toISOString()) {
+    const result = this.db.prepare('DELETE FROM task_execution_locks WHERE expires_at <= ?').run(referenceTime);
+    return result.changes;
+  }
   setTaskDeliveryStatus(id: string, status: DeliveryStatus, error?: string) {
     const result = this.db
       .prepare('UPDATE tasks SET delivery_status = ?, delivery_error = ?, updated_at = ? WHERE id = ?')
