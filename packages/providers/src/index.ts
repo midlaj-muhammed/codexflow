@@ -32,6 +32,12 @@ export interface GitProvider {
     title: string;
     body: string;
   }): Promise<RemotePullRequest>;
+  findPullRequest?(input: {
+    owner: string;
+    name: string;
+    head: string;
+    base: string;
+  }): Promise<RemotePullRequest | undefined>;
 }
 export class ProviderError extends Error {
   constructor(
@@ -172,5 +178,44 @@ export class GitHubProvider implements GitProvider {
       body: result.body ?? '',
       status: result.merged ? 'MERGED' : result.state === 'open' ? 'OPEN' : 'CLOSED',
     };
+  }
+  async findPullRequest(input: { owner: string; name: string; head: string; base: string }) {
+    const value = z
+      .object({
+        owner: z.string().min(1),
+        name: z.string().min(1),
+        head: z.string().min(1),
+        base: z.string().min(1),
+      })
+      .parse(input);
+    const pulls = z
+      .array(
+        z.object({
+          id: z.number(),
+          number: z.number(),
+          html_url: z.url(),
+          title: z.string(),
+          body: z.string().nullable(),
+          state: z.enum(['open', 'closed']),
+          merged: z.boolean().optional(),
+        }),
+      )
+      .parse(
+        await this.request(
+          `/repos/${value.owner}/${value.name}/pulls?state=all&head=${encodeURIComponent(
+            `${value.owner}:${value.head}`,
+          )}&base=${encodeURIComponent(value.base)}`,
+        ),
+      );
+    const pull = pulls[0];
+    if (!pull) return undefined;
+    return {
+      id: String(pull.id),
+      number: pull.number,
+      url: pull.html_url,
+      title: pull.title,
+      body: pull.body ?? '',
+      status: pull.merged ? 'MERGED' : pull.state === 'open' ? 'OPEN' : 'CLOSED',
+    } satisfies RemotePullRequest;
   }
 }

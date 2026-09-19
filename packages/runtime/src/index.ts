@@ -1,6 +1,13 @@
 import type { AgentRole, TaskStatus } from '@codexflow/shared';
 
 export type Permission = 'READ' | 'WRITE' | 'EXECUTE' | 'CONTROL';
+export type DeliveryStatus =
+  | 'APPROVED'
+  | 'COMMITTED'
+  | 'PUSH_FAILED'
+  | 'PUSHED'
+  | 'PR_FAILED'
+  | 'PR_CREATED';
 export type RuntimeEventType =
   | 'task.created'
   | 'task.started'
@@ -65,6 +72,7 @@ export type AgentPlugin = {
 };
 export interface RuntimePersistence {
   saveTaskState(taskId: string, status: TaskStatus): void | Promise<void>;
+  saveDeliveryState?(taskId: string, status: DeliveryStatus, error?: string): void | Promise<void>;
   appendEvent(event: RuntimeEvent): void | Promise<void>;
 }
 
@@ -88,6 +96,7 @@ const transitions: Record<TaskStatus, TaskStatus[]> = {
 };
 export class TaskLifecycleManager {
   private states = new Map<string, TaskStatus>();
+  private deliveryStates = new Map<string, DeliveryStatus>();
   constructor(private readonly persistence?: RuntimePersistence) {}
   async create(taskId: string) {
     this.states.set(taskId, 'CREATED');
@@ -106,6 +115,14 @@ export class TaskLifecycleManager {
     this.states.set(taskId, target);
     await this.persistence?.saveTaskState(taskId, target);
     return target;
+  }
+  async recordDeliveryState(taskId: string, status: DeliveryStatus, error?: string) {
+    this.deliveryStates.set(taskId, status);
+    await this.persistence?.saveDeliveryState?.(taskId, status, error);
+    return status;
+  }
+  getDeliveryState(taskId: string) {
+    return this.deliveryStates.get(taskId);
   }
 }
 export class EventBus {

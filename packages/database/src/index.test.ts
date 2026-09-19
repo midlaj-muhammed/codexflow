@@ -27,10 +27,11 @@ describe('CodexFlowStore', () => {
     expect(store.getTask(task.id as string)).toMatchObject({
       projectId: project.id,
       status: 'CREATED',
+      deliveryStatus: null,
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 2,
+      count: 3,
     });
   });
   it('validates repository input and prevents empty task prompts', () => {

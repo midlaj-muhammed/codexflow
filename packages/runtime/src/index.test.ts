@@ -38,6 +38,20 @@ describe('runtime', () => {
     await lifecycle.create('x');
     await expect(lifecycle.transition('x', 'APPLIED')).rejects.toThrow('Invalid');
   });
+  it('persists delivery state checkpoints through the lifecycle persistence hook', async () => {
+    const saved: string[] = [];
+    const lifecycle = new TaskLifecycleManager({
+      saveTaskState: () => {},
+      saveDeliveryState: (_taskId, status) => {
+        saved.push(status);
+      },
+      appendEvent: () => {},
+    });
+    await lifecycle.recordDeliveryState('x', 'COMMITTED');
+    await lifecycle.recordDeliveryState('x', 'PUSHED');
+    expect(lifecycle.getDeliveryState('x')).toBe('PUSHED');
+    expect(saved).toEqual(['COMMITTED', 'PUSHED']);
+  });
   it('cancels an active plugin', async () => {
     const manager = new AgentLifecycleManager();
     let cancelled = false;

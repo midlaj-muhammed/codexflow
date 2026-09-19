@@ -83,4 +83,7 @@ export class GitEngine {
   push(path: string, remote = 'origin', branch?: string) {
     return this.run(path, ['push', remote, branch ?? 'HEAD']);
   }
+  remoteBranchHead(path: string, remote = 'origin', branch: string) {
+    return this.run(path, ['ls-remote', remote, `refs/heads/${branch}`]);
+  }
 }

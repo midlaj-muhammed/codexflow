@@ -25,7 +25,21 @@ const migrations = [
    CREATE UNIQUE INDEX IF NOT EXISTS delivery_commits_task_fingerprint ON delivery_commits(task_id, diff_fingerprint);
    CREATE TABLE IF NOT EXISTS delivery_pushes (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, branch TEXT NOT NULL, remote TEXT NOT NULL, commit_sha TEXT NOT NULL, status TEXT NOT NULL, error TEXT, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);
    CREATE TABLE IF NOT EXISTS delivery_pull_requests (id TEXT PRIMARY KEY, task_id TEXT NOT NULL, workspace_id TEXT NOT NULL, provider TEXT NOT NULL, repository TEXT NOT NULL, branch TEXT NOT NULL, base_branch TEXT NOT NULL, commit_sha TEXT NOT NULL, number INTEGER, url TEXT, title TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, error TEXT, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, completed_at TEXT);`,
+  `ALTER TABLE tasks ADD COLUMN delivery_status TEXT;
+   ALTER TABLE tasks ADD COLUMN delivery_error TEXT;
+   CREATE INDEX IF NOT EXISTS delivery_pushes_task_commit ON delivery_pushes(task_id, commit_sha);
+   CREATE INDEX IF NOT EXISTS delivery_pull_requests_task_commit ON delivery_pull_requests(task_id, commit_sha);
+   CREATE UNIQUE INDEX IF NOT EXISTS delivery_pull_requests_success ON delivery_pull_requests(task_id, branch, commit_sha) WHERE status = 'SUCCEEDED';`,
 ];
+
+export type DeliveryStatus =
+  | 'APPROVED'
+  | 'COMMITTED'
+  | 'PUSH_FAILED'
+  | 'PUSHED'
+  | 'PR_FAILED'
+  | 'PR_CREATED';
+export type DeliveryAttemptStatus = 'PENDING' | 'SUCCEEDED' | 'FAILED';
 
 export function openDatabase(path = ':memory:'): Database {
   const db = new DatabaseSync(path);
@@ -97,14 +111,16 @@ export class CodexFlowStore {
     const id = randomUUID(),
       timestamp = now();
     this.db
-      .prepare('INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO tasks (id, project_id, prompt, status, risk_level, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
       .run(id, projectId, prompt, 'CREATED', null, timestamp, timestamp);
     return this.getTask(id)!;
   }
   getTask(id: string) {
     return this.db
       .prepare(
-        'SELECT id, project_id AS projectId, prompt, status, risk_level AS riskLevel, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE id = ?',
+        'SELECT id, project_id AS projectId, prompt, status, risk_level AS riskLevel, delivery_status AS deliveryStatus, delivery_error AS deliveryError, created_at AS createdAt, updated_at AS updatedAt FROM tasks WHERE id = ?',
       )
       .get(id) as Record<string, unknown> | undefined;
   }
@@ -112,6 +128,13 @@ export class CodexFlowStore {
     const result = this.db
       .prepare('UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?')
       .run(status, now(), id);
+    if (result.changes !== 1) throw new Error(`Task not found: ${id}`);
+    return this.getTask(id)!;
+  }
+  setTaskDeliveryStatus(id: string, status: DeliveryStatus, error?: string) {
+    const result = this.db
+      .prepare('UPDATE tasks SET delivery_status = ?, delivery_error = ?, updated_at = ? WHERE id = ?')
+      .run(status, error ?? null, now(), id);
     if (result.changes !== 1) throw new Error(`Task not found: ${id}`);
     return this.getTask(id)!;
   }
@@ -180,7 +203,7 @@ export class CodexFlowStore {
     branch: string;
     remote: string;
     commitSha: string;
-    status: string;
+    status: DeliveryAttemptStatus;
     error?: string;
     attempt: number;
   }) {
@@ -202,5 +225,100 @@ export class CodexFlowStore {
         input.status === 'SUCCEEDED' ? createdAt : null,
       );
     return id;
+  }
+  updateDeliveryPush(id: string, status: DeliveryAttemptStatus, error?: string) {
+    const completedAt = status === 'PENDING' ? null : now();
+    const result = this.db
+      .prepare('UPDATE delivery_pushes SET status = ?, error = ?, completed_at = ? WHERE id = ?')
+      .run(status, error ?? null, completedAt, id);
+    if (result.changes !== 1) throw new Error(`Delivery push not found: ${id}`);
+  }
+  listDeliveryPushes(taskId: string, commitSha: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, branch, remote, commit_sha AS commitSha, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pushes WHERE task_id = ? AND commit_sha = ? ORDER BY attempt ASC, created_at ASC',
+      )
+      .all(taskId, commitSha) as Record<string, unknown>[];
+  }
+  findSuccessfulDeliveryPush(taskId: string, commitSha: string) {
+    return this.db
+      .prepare(
+        "SELECT id, task_id AS taskId, workspace_id AS workspaceId, branch, remote, commit_sha AS commitSha, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pushes WHERE task_id = ? AND commit_sha = ? AND status = 'SUCCEEDED' ORDER BY completed_at DESC LIMIT 1",
+      )
+      .get(taskId, commitSha) as Record<string, unknown> | undefined;
+  }
+  createDeliveryPullRequest(input: {
+    taskId: string;
+    workspaceId: string;
+    provider: string;
+    repository: string;
+    branch: string;
+    baseBranch: string;
+    commitSha: string;
+    number?: number;
+    url?: string;
+    title: string;
+    body: string;
+    status: DeliveryAttemptStatus;
+    error?: string;
+    attempt: number;
+  }) {
+    const id = randomUUID(),
+      createdAt = now();
+    this.db
+      .prepare(
+        'INSERT INTO delivery_pull_requests VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        id,
+        input.taskId,
+        input.workspaceId,
+        input.provider,
+        input.repository,
+        input.branch,
+        input.baseBranch,
+        input.commitSha,
+        input.number ?? null,
+        input.url ?? null,
+        input.title,
+        input.body,
+        input.status,
+        input.error ?? null,
+        input.attempt,
+        createdAt,
+        input.status === 'SUCCEEDED' || input.status === 'FAILED' ? createdAt : null,
+      );
+    return id;
+  }
+  updateDeliveryPullRequest(
+    id: string,
+    input: {
+      status: DeliveryAttemptStatus;
+      number?: number;
+      url?: string;
+      error?: string;
+    },
+  ) {
+    const completedAt = input.status === 'PENDING' ? null : now();
+    const result = this.db
+      .prepare(
+        'UPDATE delivery_pull_requests SET status = ?, number = COALESCE(?, number), url = COALESCE(?, url), error = ?, completed_at = ? WHERE id = ?',
+      )
+      .run(input.status, input.number ?? null, input.url ?? null, input.error ?? null, completedAt, id);
+    if (result.changes !== 1) throw new Error(`Delivery pull request not found: ${id}`);
+  }
+  listDeliveryPullRequests(taskId: string, commitSha: string) {
+    return this.db
+      .prepare(
+        'SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pull_requests WHERE task_id = ? AND commit_sha = ? ORDER BY attempt ASC, created_at ASC',
+      )
+      .all(taskId, commitSha) as Record<string, unknown>[];
+  }
+  findSuccessfulDeliveryPullRequest(taskId: string, branch: string, commitSha: string) {
+    return this.db
+      .prepare(
+        "SELECT id, task_id AS taskId, workspace_id AS workspaceId, provider, repository, branch, base_branch AS baseBranch, commit_sha AS commitSha, number, url, title, body, status, error, attempt, created_at AS createdAt, completed_at AS completedAt FROM delivery_pull_requests WHERE task_id = ? AND branch = ? AND commit_sha = ? AND status = 'SUCCEEDED' ORDER BY completed_at DESC LIMIT 1",
+      )
+      .get(taskId, branch, commitSha) as Record<string, unknown> | undefined;
   }
 }
