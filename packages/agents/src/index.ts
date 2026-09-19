@@ -114,3 +114,119 @@ export class MockAgentProvider implements AgentProvider {
     for (const event of this.runs.get(runId) ?? []) yield event;
   }
 }
+
+export class AgentProviderError extends Error {
+  constructor(
+    public readonly code:
+      'AUTH_FAILED' | 'UNAVAILABLE' | 'MALFORMED_RESPONSE' | 'CANCELLED' | 'TIMEOUT',
+    message: string,
+  ) {
+    super(message);
+  }
+}
+export class OpenAIResponsesProvider implements AgentProvider {
+  private readonly events = new Map<string, AgentEvent[]>();
+  constructor(
+    private readonly apiKey: string,
+    private readonly model = 'gpt-5',
+    private readonly fetcher: typeof fetch = fetch,
+  ) {
+    if (!apiKey.trim()) throw new AgentProviderError('AUTH_FAILED', 'OpenAI API key is required');
+  }
+  async run(input: AgentRunInput): Promise<AgentRunResult> {
+    const started: AgentEvent = {
+      type: 'progress',
+      message: `${input.role} request started`,
+      at: new Date().toISOString(),
+    };
+    this.events.set(input.runId, [started]);
+    let response: Response;
+    try {
+      response = await this.fetcher('https://api.openai.com/v1/responses', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${this.apiKey}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: this.model, input: input.prompt, store: false }),
+      });
+    } catch {
+      throw new AgentProviderError('UNAVAILABLE', 'OpenAI Responses API is unavailable');
+    }
+    if (!response.ok)
+      throw new AgentProviderError(
+        response.status === 401 ? 'AUTH_FAILED' : 'UNAVAILABLE',
+        `OpenAI request failed (${response.status})`,
+      );
+    const body = (await response.json()) as { id?: string; output_text?: string };
+    if (!body.id || typeof body.output_text !== 'string')
+      throw new AgentProviderError(
+        'MALFORMED_RESPONSE',
+        'OpenAI response did not contain output text',
+      );
+    const completed: AgentEvent = {
+      type: 'completed',
+      message: `${input.role} completed`,
+      at: new Date().toISOString(),
+    };
+    const events = [started, completed];
+    this.events.set(input.runId, events);
+    return { runId: input.runId, output: body.output_text, events };
+  }
+  async cancel(runId: string) {
+    this.events.set(runId, [
+      { type: 'failed', message: 'Cancelled', at: new Date().toISOString() },
+    ]);
+  }
+  async *stream(runId: string) {
+    for (const event of this.events.get(runId) ?? []) yield event;
+  }
+}
+export type AgentRunPersistence = {
+  createRun(input: {
+    runId: string;
+    taskId: string;
+    role: string;
+    attempt: number;
+  }): Promise<void> | void;
+  appendEvent(runId: string, event: AgentEvent): Promise<void> | void;
+  finishRun(
+    runId: string,
+    status: 'COMPLETED' | 'FAILED' | 'CANCELLED',
+    error?: string,
+  ): Promise<void> | void;
+};
+export class AgentRunner {
+  constructor(
+    private readonly provider: AgentProvider,
+    private readonly persistence?: AgentRunPersistence,
+  ) {}
+  async run(
+    input: AgentRunInput & { attempt: number; timeoutMs?: number },
+  ): Promise<AgentRunResult> {
+    await this.persistence?.createRun({
+      runId: input.runId,
+      taskId: input.taskId,
+      role: input.role,
+      attempt: input.attempt,
+    });
+    const timeout = input.timeoutMs
+      ? setTimeout(() => void this.provider.cancel(input.runId), input.timeoutMs)
+      : undefined;
+    try {
+      const result = await this.provider.run(input);
+      for (const event of result.events) await this.persistence?.appendEvent(input.runId, event);
+      await this.persistence?.finishRun(input.runId, 'COMPLETED');
+      return result;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Agent execution failed';
+      await this.persistence?.finishRun(input.runId, 'FAILED', message);
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+  cancel(runId: string) {
+    return this.provider.cancel(runId);
+  }
+  stream(runId: string) {
+    return this.provider.stream(runId);
+  }
+}
