@@ -3,6 +3,16 @@ import { ZodError } from 'zod';
 
 export function apiError(error: unknown) {
   const message = error instanceof Error ? error.message : 'Request failed';
-  const status = error instanceof ZodError ? 400 : /not found/i.test(message) ? 404 : 422;
-  return NextResponse.json({ error: { message, classification: status === 422 ? 'BLOCKED' : 'PERMANENT_FAILURE' } }, { status });
+  const code =
+    error && typeof error === 'object' && 'code' in error ? String(error.code) : undefined;
+  const status =
+    error instanceof ZodError
+      ? 400
+      : code === 'DUPLICATE_EXECUTION'
+        ? 409
+        : /not found/i.test(message)
+          ? 404
+          : 422;
+  const classification = status === 409 ? 'RETRYABLE' : status === 422 ? 'BLOCKED' : 'PERMANENT_FAILURE';
+  return NextResponse.json({ error: { message, code, classification } }, { status });
 }

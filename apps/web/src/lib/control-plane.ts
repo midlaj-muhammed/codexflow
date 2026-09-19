@@ -1,9 +1,18 @@
-import { scanProject, type ProjectMetadata } from '@codexflow/agents';
+import { ApprovalService, TesterAgent, type ProjectMetadata, scanProject } from '@codexflow/agents';
 import { CodexFlowStore, openDatabase } from '@codexflow/database';
+import { DeliveryService } from '@codexflow/delivery';
 import { GitEngine } from '@codexflow/git';
+import { GitHubProvider } from '@codexflow/providers';
+import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 
 type GlobalControlPlane = typeof globalThis & {
-  __codexflowControlPlane?: { store: CodexFlowStore; git: GitEngine };
+  __codexflowControlPlane?: {
+    store: CodexFlowStore;
+    git: GitEngine;
+    events: EventBus;
+    runtime: RuntimeExecutor;
+    executions: Map<string, Promise<RuntimeExecutionResult>>;
+  };
 };
 
 const globalControlPlane = globalThis as GlobalControlPlane;
@@ -12,12 +21,76 @@ const globalControlPlane = globalThis as GlobalControlPlane;
 export function controlPlane() {
   if (!globalControlPlane.__codexflowControlPlane) {
     const path = process.env.CODEXFLOW_DATABASE_PATH ?? '/tmp/codexflow-control-plane.sqlite';
+    const store = new CodexFlowStore(openDatabase(path));
+    const events = new EventBus();
     globalControlPlane.__codexflowControlPlane = {
-      store: new CodexFlowStore(openDatabase(path)),
+      store,
       git: new GitEngine(),
+      events,
+      runtime: RuntimeExecutor.fromEnvironment({ store, events }),
+      executions: new Map(),
     };
   }
   return globalControlPlane.__codexflowControlPlane;
+}
+
+/** Starts the existing RuntimeExecutor and deliberately does not orchestrate agents in HTTP code. */
+export function startTaskExecution(taskId: string) {
+  const plane = controlPlane();
+  const existing = plane.executions.get(taskId);
+  if (existing) return { started: false, execution: existing };
+  if (!plane.store.getTask(taskId)) throw new Error('Task not found');
+  const execution = plane.runtime.execute(taskId).finally(() => {
+    plane.executions.delete(taskId);
+  });
+  plane.executions.set(taskId, execution);
+  return { started: true, execution };
+}
+
+/** Delegates commit/push/PR creation to the frozen durable delivery saga. */
+export async function deliverApprovedTask(taskId: string) {
+  const { store, git, events } = controlPlane();
+  const snapshot = taskSnapshot(taskId);
+  if (!snapshot?.task || !snapshot.project || !snapshot.repository || !snapshot.workspace)
+    throw new Error('Task delivery context is unavailable');
+  if (snapshot.task.status !== 'APPROVED') throw new Error('Task is not approved for delivery');
+  const token = process.env.CODEXFLOW_GITHUB_TOKEN ?? process.env.CODEXFLOW_GITHUB_E2E_TOKEN;
+  if (!token) throw new Error('GitHub delivery provider is not configured');
+  const diff = (await git.diff(String(snapshot.workspace.rootPath))).stdout;
+  const changedFiles = (await git.changedFiles(String(snapshot.workspace.rootPath))).stdout
+    .split('\n')
+    .map((file) => file.trim())
+    .filter(Boolean);
+  const metadata = (snapshot.project.metadata ?? {}) as Record<string, unknown>;
+  const command = typeof metadata.testCommand === 'string' ? metadata.testCommand : undefined;
+  if (!command) throw new Error('No project test command is available for final verification');
+  const approval = store.loadApproval(taskId);
+  if (!approval) throw new Error('Approval record is unavailable');
+  const verification = { commands: [command], requiresNewTests: false, rationale: 'Project scan final verification' };
+  const delivery = new DeliveryService(
+    git,
+    new ApprovalService(store),
+    new TesterAgent(),
+    new GitHubProvider(token),
+    undefined,
+    undefined,
+    store,
+    { lifecycle: { recordDeliveryState: async (_taskId, status) => status }, events },
+  );
+  return delivery.deliver({
+    taskId,
+    workspaceId: String(snapshot.workspace.id),
+    workspacePath: String(snapshot.workspace.rootPath),
+    branch: String(snapshot.workspace.branch),
+    baselineCommit: String(snapshot.workspace.baselineCommit),
+    diff,
+    changedFiles,
+    verification,
+    risk: approval.risk,
+    owner: String(snapshot.repository.owner),
+    repository: String(snapshot.repository.name),
+    baseBranch: String(snapshot.repository.defaultBranch),
+  });
 }
 
 export async function importLocalRepository(input: {
@@ -62,12 +135,14 @@ export function taskSnapshot(taskId: string) {
   const approval = store.loadApproval(taskId);
   const commit = store.findLatestDeliveryCommit(taskId);
   const sha = commit ? String(commit.sha) : undefined;
+  const agents = store.listTaskTimeline(taskId);
   return {
     task,
     project,
     repository,
     workspace,
-    agents: store.listTaskTimeline(taskId),
+    agents,
+    agentEvents: agents.flatMap((agent) => store.listAgentEvents(agent.id)),
     plans: store.listPlans(taskId),
     reviews: store.listReviews(taskId),
     tests: store.listTestRuns(taskId),

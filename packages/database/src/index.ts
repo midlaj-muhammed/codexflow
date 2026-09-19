@@ -43,6 +43,13 @@ const migrations = [
    ALTER TABLE approvals ADD COLUMN state TEXT;
    ALTER TABLE approvals ADD COLUMN approved_at TEXT;
    CREATE INDEX IF NOT EXISTS approvals_task_created ON approvals(task_id, created_at DESC);`,
+  `CREATE TABLE IF NOT EXISTS task_execution_locks (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+  );
+   CREATE INDEX IF NOT EXISTS task_execution_locks_expires ON task_execution_locks(expires_at);`,
 ];
 
 export type DeliveryStatus =
@@ -302,6 +309,38 @@ export class CodexFlowStore {
       .run(status, now(), id);
     if (result.changes !== 1) throw new Error(`Task not found: ${id}`);
     return this.getTask(id)!;
+  }
+  /**
+   * Acquires the one durable execution lease for a task. The conditional upsert
+   * means separate runtime processes cannot both begin the same task; an
+   * expired lease can be safely reclaimed after an interrupted process.
+   */
+  acquireTaskExecutionLock(taskId: string, ownerId: string, leaseMs = 15 * 60_000) {
+    if (!Number.isFinite(leaseMs) || leaseMs <= 0) throw new Error('Execution lease must be positive');
+    const acquiredAt = now();
+    const expiresAt = new Date(Date.now() + leaseMs).toISOString();
+    const result = this.db
+      .prepare(
+        `INSERT INTO task_execution_locks (task_id, owner_id, acquired_at, expires_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET
+           owner_id = excluded.owner_id,
+           acquired_at = excluded.acquired_at,
+           expires_at = excluded.expires_at
+         WHERE task_execution_locks.expires_at <= excluded.acquired_at`,
+      )
+      .run(taskId, ownerId, acquiredAt, expiresAt);
+    return result.changes === 1;
+  }
+  releaseTaskExecutionLock(taskId: string, ownerId: string) {
+    this.db
+      .prepare('DELETE FROM task_execution_locks WHERE task_id = ? AND owner_id = ?')
+      .run(taskId, ownerId);
+  }
+  getTaskExecutionLock(taskId: string) {
+    return this.db
+      .prepare('SELECT task_id AS taskId, owner_id AS ownerId, acquired_at AS acquiredAt, expires_at AS expiresAt FROM task_execution_locks WHERE task_id = ?')
+      .get(taskId) as Record<string, unknown> | undefined;
   }
   setTaskDeliveryStatus(id: string, status: DeliveryStatus, error?: string) {
     const result = this.db

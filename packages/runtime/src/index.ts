@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto';
 import type { AgentRole, TaskStatus } from '@codexflow/shared';
 import { readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
   CoreAgentPipeline,
+  ApprovalService,
   OpenAIResponsesProvider,
+  RiskEngine,
   scanProject,
   type CoderModelOutput,
   type PipelineStage,
@@ -396,6 +399,8 @@ export class RuntimeExecutor {
         new RuntimeExecutorError('DUPLICATE_EXECUTION', `Task is already executing: ${taskId}`),
       );
     this.activeTasks.add(taskId);
+    const lockOwner = randomUUID();
+    let hasExecutionLock = false;
     const stages: RuntimeExecutionStage[] = [];
     let currentState: TaskStatus | undefined;
     let workspace: PersistedWorkspace | undefined;
@@ -407,6 +412,12 @@ export class RuntimeExecutor {
 
     try {
       const task = this.loadTask(taskId);
+      hasExecutionLock = this.store.acquireTaskExecutionLock(taskId, lockOwner);
+      if (!hasExecutionLock)
+        throw new RuntimeExecutorError(
+          'DUPLICATE_EXECUTION',
+          `Task is already executing: ${taskId}`,
+        );
       if (!startableStates.has(task.status))
         throw new RuntimeExecutorError(
           'INVALID_TASK_STATE',
@@ -481,8 +492,19 @@ export class RuntimeExecutor {
       tests = result.tests;
 
       if (result.next === 'READY_FOR_APPROVAL') {
+        const approval = new ApprovalService(this.store).request(
+          taskId,
+          workspace.id,
+          diff,
+          this.assessRisk(changedFiles, diff, review, tests),
+        );
         currentState = await this.transition(taskId, currentState!, 'READY_FOR_APPROVAL');
-        await this.events.emit({ type: 'approval.required', taskId, at: new Date().toISOString() });
+        await this.events.emit({
+          type: 'approval.required',
+          taskId,
+          at: new Date().toISOString(),
+          payload: { workspaceId: workspace.id, riskLevel: approval.risk.level },
+        });
         return {
           taskId,
           status: 'SUCCEEDED',
@@ -522,8 +544,26 @@ export class RuntimeExecutor {
       });
       return this.failed(taskId, stages, failure, currentState, workspace, changedFiles, diff, review, tests);
     } finally {
+      if (hasExecutionLock) this.store.releaseTaskExecutionLock(taskId, lockOwner);
       this.activeTasks.delete(taskId);
     }
+  }
+
+  private assessRisk(
+    changedFiles: string[],
+    diff: string,
+    review: ReviewerResult | undefined,
+    tests: TestExecution[],
+  ) {
+    const additions = diff.split('\n').filter((line) => /^\+[^+]/.test(line)).length;
+    const deletions = diff.split('\n').filter((line) => /^-[^-]/.test(line)).length;
+    return new RiskEngine().assess({
+      changedFiles,
+      additions,
+      deletions,
+      failedChecks: tests.filter((test) => test.status !== 'PASSED').map((test) => test.command),
+      reviewerFindings: review?.findings,
+    });
   }
 
   private loadTask(taskId: string): StoreTask {

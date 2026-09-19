@@ -202,6 +202,10 @@ describe('runtime', () => {
     expect(readFileSync(join(repositoryPath, 'src', 'message.txt'), 'utf8')).toBe('hello');
     expect(result.diff).toContain('hello codexflow');
     expect(store.getTask(String(task.id))).toMatchObject({ status: 'READY_FOR_APPROVAL' });
+    expect(store.loadApproval(String(task.id))).toMatchObject({
+      workspaceId: result.workspace?.id,
+      state: 'PENDING',
+    });
     expect(store.getWorkspaceForTask(String(task.id))).toMatchObject({
       branch: `codexflow/task-${task.id}`,
     });
@@ -312,7 +316,7 @@ describe('runtime', () => {
     const executor = executorFor(duplicate, slowProvider);
     const first = executor.execute(String(duplicate.task.id));
     await providerStartedPromise;
-    await expect(executor.execute(String(duplicate.task.id))).resolves.toMatchObject({
+    await expect(executorFor(duplicate, slowProvider).execute(String(duplicate.task.id))).resolves.toMatchObject({
       status: 'FAILED',
       error: { code: 'DUPLICATE_EXECUTION' },
     });

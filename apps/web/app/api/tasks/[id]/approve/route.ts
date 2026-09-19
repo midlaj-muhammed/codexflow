@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { ApprovalService } from '@codexflow/agents';
 import { apiError } from '@/lib/api';
-import { controlPlane, taskSnapshot } from '@/lib/control-plane';
+import { controlPlane, deliverApprovedTask, taskSnapshot } from '@/lib/control-plane';
 
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -12,7 +12,8 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     const diff = (await controlPlane().git.diff(String(snapshot.workspace.rootPath))).stdout;
     const approval = new ApprovalService(controlPlane().store).approve(id, 'web-user', diff);
     controlPlane().store.transitionTask(id, 'APPROVED');
-    return NextResponse.json({ approval, task: taskSnapshot(id) });
+    const pullRequest = await deliverApprovedTask(id);
+    return NextResponse.json({ approval, pullRequest, task: taskSnapshot(id) });
   } catch (error) {
     return apiError(error);
   }

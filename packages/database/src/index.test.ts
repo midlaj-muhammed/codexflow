@@ -31,7 +31,7 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 4,
+      count: 5,
     });
   });
   it('persists fingerprint-bound approvals through the existing approvals table', () => {
@@ -177,5 +177,16 @@ describe('CodexFlowStore', () => {
     expect(store.listTestRuns(String(task.id))).toEqual([
       expect.objectContaining({ command: 'printf ok', status: 'PASSED', exitCode: 0 }),
     ]);
+  });
+  it('uses a durable execution lease to prevent concurrent task execution and reclaim stale work', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const repository = store.createRepository({ provider: 'github', owner: 'acme', name: 'locks', url: 'https://github.com/acme/locks', defaultBranch: 'main' });
+    const project = store.createProject(String(repository.id), 'Locks');
+    const task = store.createTask(String(project.id), 'Lock execution');
+    expect(store.acquireTaskExecutionLock(String(task.id), 'runtime-a', 1_000)).toBe(true);
+    expect(store.acquireTaskExecutionLock(String(task.id), 'runtime-b', 1_000)).toBe(false);
+    expect(store.getTaskExecutionLock(String(task.id))).toMatchObject({ ownerId: 'runtime-a' });
+    store.releaseTaskExecutionLock(String(task.id), 'runtime-a');
+    expect(store.acquireTaskExecutionLock(String(task.id), 'runtime-b', 1_000)).toBe(true);
   });
 });
