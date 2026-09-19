@@ -356,6 +356,36 @@ export class CoreAgentPipeline {
     };
   }
 }
+export class VerificationRepairLoop {
+  constructor(
+    private readonly tester: TesterAgent,
+    private readonly maxRepairs = 2,
+  ) {}
+  async run(input: {
+    workspacePath: string;
+    plan: VerificationPlan;
+    repair: (attempt: number) => Promise<void>;
+  }) {
+    let tests = await this.tester.verify(input.workspacePath, input.plan);
+    for (
+      let attempt = 1;
+      !tests.every((test) => test.status === 'PASSED') && attempt <= this.maxRepairs;
+      attempt += 1
+    ) {
+      await input.repair(attempt);
+      tests = await this.tester.verify(input.workspacePath, input.plan);
+      if (tests.every((test) => test.status === 'PASSED'))
+        return { status: 'PASSED' as const, tests, repairs: attempt };
+    }
+    return {
+      status: tests.every((test) => test.status === 'PASSED')
+        ? ('PASSED' as const)
+        : ('BLOCKED' as const),
+      tests,
+      repairs: this.maxRepairs,
+    };
+  }
+}
 export type TestExecution = {
   command: string;
   exitCode: number | null;

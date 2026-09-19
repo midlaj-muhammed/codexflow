@@ -12,6 +12,7 @@ import {
   ReviewerAgent,
   SupervisorAgent,
   TesterAgent,
+  VerificationRepairLoop,
   scanProject,
 } from './index.js';
 describe('scanner and mock provider', () => {
@@ -169,6 +170,22 @@ describe('scanner and mock provider', () => {
     });
     expect(result).toMatchObject({
       next: 'READY_FOR_APPROVAL',
+      tests: [expect.objectContaining({ status: 'PASSED' })],
+    });
+  });
+  it('reruns real verification after repair until it passes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'repair-'));
+    const loop = new VerificationRepairLoop(new TesterAgent());
+    const result = await loop.run({
+      workspacePath: root,
+      plan: { commands: ['test -f fixed.txt'], requiresNewTests: false, rationale: 'fixture' },
+      repair: async () => {
+        writeFileSync(join(root, 'fixed.txt'), 'fixed');
+      },
+    });
+    expect(result).toMatchObject({
+      status: 'PASSED',
+      repairs: 1,
       tests: [expect.objectContaining({ status: 'PASSED' })],
     });
   });
