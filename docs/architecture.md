@@ -11,31 +11,34 @@ Browser
   ↓
 Next.js Web App
   ↓
-Node.js / TypeScript Backend
+Next.js / TypeScript Control Plane
   ↓
-Composable Agent Runtime
+RuntimeExecutor + Supervisor
   ↓
 Workspace Manager
   ↓
 Git Worktree
   ↓
-AI Agent Plugins
+Planner → Coder → Specialists → Reviewer → Tester → Repair
   ↓
 Verification / Risk
   ↓
 Human Approval
   ↓
-Commit → Push → Pull Request
+Durable Commit → Push → GitHub Pull Request
 ```
 
 ## Major boundaries
 
 - Web UI: user interaction, task views, agent timeline, diff review, PR and evaluation views.
 - Backend: orchestration APIs, persistence, Git operations, workspace lifecycle.
-- Runtime: plugin registry, commands, events, scheduling, lifecycle.
+- Runtime: `RuntimeExecutor` owns task execution, execution leases,
+  cancellation, bounded timeouts, lifecycle transitions, and persistence.
+- Supervisor: deterministically selects BUG_FIX, REFACTOR, SECURITY, or
+  TEST_GENERATION and supplies bounded specialist plans.
 - Workspace: isolated Git worktrees and execution policies.
 - Git Engine: local Git operations.
-- Git Provider: GitHub repository and Pull Request operations.
+- Git Provider: GitHub-only repository, PR, check-run, and PR-refresh operations.
 - Agents: specialized reasoning/execution components.
 - Verification: real process execution and result collection.
 - Risk: deterministic signals plus AI review.
@@ -62,17 +65,17 @@ Cordis or another composable-agent harness may be integrated through an adapter.
 ## Core flow
 
 ```text
-Repository
+GitHub repository
   ↓
 Task
   ↓
 Planner
   ↓
-Verification Strategy
-  ↓
 Worktree
   ↓
 Coder
+  ↓
+Specialist stage when selected
   ↓
 Reviewer + Tester
   ↓
@@ -86,5 +89,9 @@ Commit
   ↓
 Push
   ↓
-Pull Request
+GitHub Pull Request
 ```
+
+Delivery only succeeds when the persisted delivery commit, remote task branch,
+and GitHub PR head all reference the same SHA. PR refresh rechecks this
+invariant before exposing current remote status or checks.
