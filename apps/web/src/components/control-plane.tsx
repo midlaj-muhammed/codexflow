@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, type ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
 
 type Json = Record<string, unknown>;
 type TaskDetail = {
@@ -19,6 +20,7 @@ type TaskDetail = {
 };
 type EvaluationSummary = { benchmarks: Array<Json & { taskCount: number }>; runs: Json[]; metrics: Json };
 type Operations = { tasks: { total: number; failed: number; byState: Json }; agents: { total: number; failed: number }; execution: { activeLeases: number; reclaimedStaleLeases: number } };
+type GitHubConnection = { connected: boolean; login?: string };
 
 const statusClass = (value: unknown) => `status status-${String(value ?? 'UNKNOWN').toLowerCase()}`;
 const text = (value: unknown, fallback = 'Not available') =>
@@ -89,22 +91,28 @@ export function ControlPlane() {
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [selectedProject, setSelectedProject] = useState('');
+  const [github, setGithub] = useState<GitHubConnection>({ connected: false });
+  const [githubRepositories, setGithubRepositories] = useState<Json[]>([]);
+  const [selectedGitHubRepository, setSelectedGitHubRepository] = useState<Json>();
+  const [health, setHealth] = useState<Json>();
 
   const refresh = useCallback(async () => {
     try {
       setError(undefined);
-      const [repoResult, projectResult, taskResult, evaluationResult, operationsResult] = await Promise.all([
+      const [repoResult, projectResult, taskResult, evaluationResult, operationsResult, githubResult] = await Promise.all([
         request<{ repositories: Json[] }>('/api/repositories'),
         request<{ projects: Json[] }>('/api/projects'),
         request<{ tasks: Json[] }>('/api/tasks'),
         request<EvaluationSummary>('/api/evaluations'),
         request<{ operations: Operations }>('/api/operations'),
+        request<{ github: GitHubConnection }>('/api/github/status'),
       ]);
       setRepositories(repoResult.repositories);
       setProjects(projectResult.projects);
       setTasks(taskResult.tasks);
       setEvaluation(evaluationResult);
       setOperations(operationsResult.operations);
+      setGithub(githubResult.github);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load control-plane data'); }
   }, []);
   useEffect(() => {
@@ -125,7 +133,8 @@ export function ControlPlane() {
     event.preventDefault(); setBusy(true); setError(undefined);
     const form = new FormData(event.currentTarget);
     try {
-      await request('/api/repositories/import', { method: 'POST', body: JSON.stringify({ owner: form.get('owner'), name: form.get('name'), url: form.get('url'), defaultBranch: form.get('defaultBranch'), localPath: form.get('localPath') }) });
+      const result = await request<{ project: Json }>('/api/repositories/import', { method: 'POST', body: JSON.stringify({ localPath: form.get('localPath') }) });
+      setSelectedProject(String(result.project.id));
       event.currentTarget.reset(); await refresh();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Import failed'); } finally { setBusy(false); }
   }
@@ -137,20 +146,51 @@ export function ControlPlane() {
       setDetail(result.task); event.currentTarget.reset(); await refresh();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Task creation failed'); } finally { setBusy(false); }
   }
+  async function loadGitHubRepositories() {
+    try {
+      setBusy(true); setError(undefined);
+      const result = await request<{ repositories: Json[] }>('/api/github/repositories');
+      setGithubRepositories(result.repositories);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'GitHub repositories could not be loaded'); } finally { setBusy(false); }
+  }
+  async function importSelectedGitHubRepository(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedGitHubRepository) return;
+    const form = new FormData(event.currentTarget);
+    try {
+      setBusy(true); setError(undefined);
+      const result = await request<{ project: Json }>('/api/repositories/import', { method: 'POST', body: JSON.stringify({
+        owner: selectedGitHubRepository.owner, name: selectedGitHubRepository.name, url: selectedGitHubRepository.url,
+        defaultBranch: selectedGitHubRepository.defaultBranch, localPath: form.get('localPath'),
+      }) });
+      setSelectedProject(String(result.project.id)); setSelectedGitHubRepository(undefined); await refresh();
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Repository import failed'); } finally { setBusy(false); }
+  }
+  async function runHealth(projectId: string) {
+    try { setBusy(true); setError(undefined); setHealth((await request<{ health: Json }>(`/api/projects/${projectId}/health`, { method: 'POST' })).health); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Project health inspection failed'); } finally { setBusy(false); }
+  }
+  async function publishProject(projectId: string, projectName: string) {
+    const name = window.prompt('GitHub repository name', projectName);
+    if (!name) return;
+    try { setBusy(true); setError(undefined); await request(`/api/projects/${projectId}/publish`, { method: 'POST', body: JSON.stringify({ name, private: true }) }); await refresh(); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : 'Project publication failed'); } finally { setBusy(false); }
+  }
   async function openTask(id: string) {
     try { setDetail((await request<{ task: TaskDetail }>(`/api/tasks/${id}`)).task); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load task'); }
   }
   const active = useMemo(() => tasks.filter((task) => !['APPLIED', 'REJECTED', 'CANCELLED', 'FAILED'].includes(String(task.status))).length, [tasks]);
   return <main className="shell">
-    <header className="topbar"><a className="brand" href="#top">CODEX<span>FLOW</span></a><nav><a href="#projects">Projects</a><a href="#tasks">Tasks</a><a href="#delivery">Delivery</a></nav><button className="button secondary" onClick={() => void refresh()} disabled={busy}>Refresh</button></header>
-    <section className="hero" id="top"><p className="eyebrow">DEVELOPER CONTROL PLANE</p><h1>Understand every agent change before it reaches GitHub.</h1><p>Live data is persisted by CodexFlow’s runtime. Approval, verification, and delivery remain backend-enforced.</p><div className="metrics"><div><strong>{repositories.length}</strong><span>repositories</span></div><div><strong>{projects.length}</strong><span>projects</span></div><div><strong>{active}</strong><span>active tasks</span></div></div></section>
+    <header className="topbar"><Link className="brand" href="/">CODEX<span>FLOW</span></Link><nav><a href="#projects">Projects</a><a href="#tasks">Tasks</a><a href="#evaluation">Evaluations</a><a href="#operations">Operations</a></nav><div className="account-status">{github.connected ? <>GitHub <strong>@{github.login}</strong> <span className="status status-passed">CONNECTED</span></> : <span className="subtle">GitHub not connected</span>}</div><button className="button secondary" onClick={() => void refresh()} disabled={busy}>Refresh</button></header>
+    <section className="hero" id="top"><p className="eyebrow">DEVELOPER CONTROL PLANE</p><h1>Take a verified change from task to GitHub.</h1><p>Select a project, describe the outcome you want, then inspect every persisted plan, agent result, review, test, risk, and delivery checkpoint.</p><div className="actions"><a className="button" href="#new-task">New task</a><a className="button secondary" href="#local-project">Import project</a>{github.connected ? <button className="button secondary" onClick={() => void loadGitHubRepositories()} disabled={busy}>Browse GitHub</button> : null}</div><div className="metrics"><div><strong>{repositories.length}</strong><span>repositories</span></div><div><strong>{projects.length}</strong><span>projects</span></div><div><strong>{active}</strong><span>active tasks</span></div></div></section>
     {error && <section className="notice" role="alert"><strong>Action blocked.</strong> {error}</section>}
     <section className="workflow" aria-label="CodexFlow workflow">{['Repository','Scan','Task','Agents','Review','Verify','Approve','Deliver','PR'].map((step) => <span key={step}>{step}</span>)}</section>
-    <section className="split" id="projects"><article className="card"><h2>Import a local repository</h2><p className="subtle">Imports scan actual files and Git status. Credentials stay server-side.</p><form onSubmit={importRepository} className="form"><input name="owner" placeholder="GitHub owner" required /><input name="name" placeholder="Repository name" required /><input name="url" type="url" placeholder="https://github.com/owner/repository" required /><input name="defaultBranch" defaultValue="main" required /><input name="localPath" placeholder="Absolute local clone path" required /><button className="button" disabled={busy}>Import & scan</button></form></article><article className="card"><h2>Create task</h2><p className="subtle">Describe the work. The runtime owns agents, Git, risk, approval, and delivery.</p>{projects.length ? <form onSubmit={createTask} className="form"><select name="projectId" value={selectedProject || String(projects[0]?.id ?? '')} onChange={(event) => setSelectedProject(event.target.value)}>{projects.map((project) => <option key={String(project.id)} value={String(project.id)}>{String(project.name)}</option>)}</select><textarea name="description" placeholder="Describe the coding task" minLength={3} required /><button className="button" disabled={busy}>Create task</button></form> : <Empty>Import a local repository before creating a task.</Empty>}</article></section>
-    <section className="card" id="projects"><h2>Projects & repository status</h2>{repositories.length ? <div className="table">{repositories.map((repo) => <div className="row" key={String(repo.id)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.defaultBranch)} · {String((repo.git as Json | undefined)?.status ?? 'UNKNOWN')}</small></div><div>{projects.filter((project) => project.repositoryId === repo.id).map((project) => <span className="tag" key={String(project.id)}>{String(project.name)}</span>)}</div></div>)}</div> : <Empty>No repository has been imported.</Empty>}</section>
+    <section className="split" id="projects"><article className="card" id="local-project"><p className="eyebrow">LOCAL PROJECT</p><h2>Open a local Git project</h2><p className="subtle">CodexFlow’s server inspects the path you provide. Browsers cannot grant the server arbitrary filesystem access, so this must be an absolute path available to the server.</p><form onSubmit={importRepository} className="form"><label htmlFor="local-path">Local project path</label><input id="local-path" name="localPath" placeholder="/absolute/path/to/project" required /><button className="button" disabled={busy}>Import & scan project</button></form></article><article className="card" id="new-task"><p className="eyebrow">NEW TASK</p><h2>What do you want CodexFlow to change?</h2><p className="subtle">The exact task text is persisted and becomes the runtime prompt.</p>{projects.length ? <form onSubmit={createTask} className="form"><label htmlFor="project">Project</label><select id="project" name="projectId" value={selectedProject || String(projects[0]?.id ?? '')} onChange={(event) => setSelectedProject(event.target.value)}>{projects.map((project) => <option key={String(project.id)} value={String(project.id)}>{String(project.name)}</option>)}</select><label htmlFor="task-prompt">Task</label><textarea id="task-prompt" name="description" placeholder="Fix the failing authentication tests and handle expired sessions correctly." minLength={3} maxLength={10_000} required /><button className="button" disabled={busy}>Start task</button></form> : <Empty>Import a local project or GitHub clone before creating a task.</Empty>}</article></section>
+    {github.connected ? <section className="card"><p className="eyebrow">GITHUB</p><h2>Connect a repository</h2><p className="subtle">Connected server account: @{github.login}. Repository identity is read from GitHub; credentials never reach this browser.</p><button className="button secondary" onClick={() => void loadGitHubRepositories()} disabled={busy}>Load repositories</button>{githubRepositories.length ? <div className="table">{githubRepositories.map((repo) => <button className="row task-row" type="button" key={String(repo.id)} onClick={() => setSelectedGitHubRepository(repo)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.private) === 'true' ? 'Private' : 'Public'} · {String(repo.defaultBranch)}</small></div><span className="tag">Select</span></button>)}</div> : null}{selectedGitHubRepository ? <form className="form" onSubmit={importSelectedGitHubRepository}><h3>Scan {String(selectedGitHubRepository.owner)}/{String(selectedGitHubRepository.name)}</h3><label htmlFor="github-local-path">Existing local clone path</label><input id="github-local-path" name="localPath" placeholder="/absolute/path/to/local/clone" required /><button className="button" disabled={busy}>Import selected repository</button></form> : null}</section> : <section className="card"><h2>Connect GitHub</h2><p className="subtle">Configure the server-side GitHub credential to browse repositories and publish local projects. OAuth login is not configured in this developer-operated deployment.</p></section>}
+    <section className="card" id="projects"><p className="eyebrow">PROJECTS</p><h2>Project health and repository status</h2>{repositories.length ? <div className="table">{repositories.map((repo) => <div className="row" key={String(repo.id)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.defaultBranch)} · {String((repo.git as Json | undefined)?.status ?? 'UNKNOWN')} · {String((repo.git as Json | undefined)?.branch ?? 'unknown branch')}</small></div><div className="row-actions">{projects.filter((project) => project.repositoryId === repo.id).map((project) => <span className="tag" key={String(project.id)}>{String(project.name)} <button type="button" onClick={() => void runHealth(String(project.id))}>Run checks</button><button type="button" onClick={() => void publishProject(String(project.id), String(project.name))} disabled={!github.connected || String(repo.owner) !== 'local'}>{String(repo.owner) === 'local' ? 'Publish to GitHub' : 'Connected'}</button></span>)}</div></div>)}</div> : <Empty>No project has been imported.</Empty>}{health ? <article className="panel health"><h3>Project health</h3><p>{String((health.git as Json | undefined)?.dirty) === 'true' ? 'Working tree has changes' : 'Git working tree is clean'}</p><p className="subtle">Detected: {Array.isArray((health.metadata as Json | undefined)?.language) ? ((health.metadata as Json).language as unknown[]).join(', ') : 'No language metadata'} · {text((health.metadata as Json | undefined)?.framework)}</p>{Array.isArray(health.results) && health.results.length ? <ul className="runs">{(health.results as Json[]).map((result) => <li key={String(result.command)}><span className={statusClass(result.status)}>{String(result.status)}</span><code>{String(result.command)}</code><small>exit {String(result.exitCode ?? '—')} · {String(result.durationMs)}ms</small>{result.stderr ? <small>{String(result.stderr).slice(0, 500)}</small> : null}</li>)}</ul> : <Empty>No safe lint, test, or build command was detected. Inspect the project configuration before creating a task.</Empty>}</article> : null}</section>
     <section className="card" id="tasks"><h2>Tasks</h2>{tasks.length ? <div className="table">{tasks.map((task) => <button className="row task-row" onClick={() => void openTask(String(task.id))} key={String(task.id)}><div><strong>{String(task.prompt)}</strong><small>{String(task.createdAt)}</small></div><span className={statusClass(task.deliveryStatus ?? task.status)}>{String(task.deliveryStatus ?? task.status)}</span></button>)}</div> : <Empty>No tasks yet. Create one to start a persisted lifecycle.</Empty>}</section>
     <section className="card" id="evaluation"><h2>Evaluation benchmarks</h2>{evaluation ? <><p className="subtle">{evaluation.benchmarks.reduce((count, benchmark) => count + Number(benchmark.taskCount), 0)} controlled tasks · {evaluation.runs.length} persisted runs</p><div className="metrics"><div><strong>{String(evaluation.metrics.finalTaskSuccessRate ?? '—')}</strong><span>technical success</span></div><div><strong>{String(evaluation.metrics.repairRate ?? '—')}</strong><span>repair rate</span></div><div><strong>{String(evaluation.metrics.blockedRate ?? '—')}</strong><span>blocked rate</span></div></div><ul className="runs">{evaluation.benchmarks.map((benchmark) => <li key={String(benchmark.id)}><strong>{String(benchmark.name)}</strong><small>v{String(benchmark.version)} · {String(benchmark.taskCount)} tasks</small></li>)}</ul></> : <Empty>Loading persisted benchmark records.</Empty>}</section>
-    <section className="card"><h2>Operations</h2>{operations ? <div className="metrics"><div><strong>{operations.tasks.total}</strong><span>persisted tasks</span></div><div><strong>{operations.agents.failed}</strong><span>agent failures</span></div><div><strong>{operations.execution.activeLeases}</strong><span>active leases</span></div><div><strong>{operations.tasks.failed}</strong><span>blocked/failed tasks</span></div></div> : <Empty>Loading persisted operational state.</Empty>}</section>
+    <section className="card" id="operations"><h2>Operations</h2>{operations ? <div className="metrics"><div><strong>{operations.tasks.total}</strong><span>persisted tasks</span></div><div><strong>{operations.agents.failed}</strong><span>agent failures</span></div><div><strong>{operations.execution.activeLeases}</strong><span>active leases</span></div><div><strong>{operations.tasks.failed}</strong><span>blocked/failed tasks</span></div></div> : <Empty>Loading persisted operational state.</Empty>}</section>
   <div id="delivery">{detail ? <Detail detail={detail} onUpdate={(task) => { setDetail(task); void refresh(); }} onError={setError} /> : <section className="card"><h2>Agent run</h2><Empty>Select a task to inspect its plan, agents, verification, risk, approval, delivery, and evaluation records.</Empty></section>}</div>
   </main>;
 }

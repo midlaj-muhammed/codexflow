@@ -5,6 +5,7 @@ import { calculateEvaluationMetrics, ensureStarterBenchmark } from '@codexflow/e
 import { GitEngine } from '@codexflow/git';
 import { GitHubProvider } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
+import { basename } from 'node:path';
 
 type GlobalControlPlane = typeof globalThis & {
   __codexflowControlPlane?: {
@@ -33,6 +34,24 @@ export function controlPlane() {
     };
   }
   return globalControlPlane.__codexflowControlPlane;
+}
+
+function githubToken() {
+  return process.env.CODEXFLOW_GITHUB_TOKEN ?? process.env.CODEXFLOW_GITHUB_E2E_TOKEN;
+}
+
+export async function githubConnection() {
+  const token = githubToken();
+  if (!token) return { connected: false as const };
+  const provider = new GitHubProvider(token);
+  const account = await provider.authenticate(token);
+  return { connected: true as const, login: account.login };
+}
+
+export async function githubRepositories() {
+  const token = githubToken();
+  if (!token) throw new Error('GitHub is not connected on this server');
+  return new GitHubProvider(token).listRepositories();
 }
 
 /** Starts the existing RuntimeExecutor and deliberately does not orchestrate agents in HTTP code. */
@@ -96,6 +115,9 @@ export async function deliverApprovedTask(taskId: string) {
     owner: String(snapshot.repository.owner),
     repository: String(snapshot.repository.name),
     baseBranch: String(snapshot.repository.defaultBranch),
+    taskPrompt: String(snapshot.task.prompt),
+    agentRuns: snapshot.agents.map((agent) => ({ role: String(agent.role), status: String(agent.status) })),
+    reviewFindings: snapshot.reviews[0]?.findings,
   });
 }
 
@@ -136,20 +158,84 @@ export async function refreshTaskPullRequest(taskId: string) {
   return delivery.refreshPullRequest(record);
 }
 
+function githubRemote(remote: string | undefined) {
+  if (!remote) return undefined;
+  const match = remote.match(/github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  return match ? { owner: match[1], name: match[2], url: `https://github.com/${match[1]}/${match[2]}` } : undefined;
+}
+
 export async function importLocalRepository(input: {
-  provider: 'github';
-  owner: string;
-  name: string;
-  url: string;
-  defaultBranch: string;
+  owner?: string;
+  name?: string;
+  url?: string;
+  defaultBranch?: string;
   localPath: string;
 }) {
   const { store, git } = controlPlane();
+  if (!(await git.isRepository(input.localPath)))
+    throw new Error('Selected local folder is not a Git repository. Initialize Git before importing it.');
   const state = await git.inspect(input.localPath);
+  let remote: string | undefined;
+  try { remote = (await git.remoteUrl(input.localPath)).stdout; } catch { /* local-only repository */ }
+  const github = githubRemote(remote);
   const metadata = await scanProject(input.localPath);
-  const repository = store.createRepository(input);
-  const project = store.createProject(String(repository.id), input.name, metadata as Record<string, unknown>);
+  const name = input.name?.trim() || github?.name || basename(input.localPath);
+  const owner = input.owner?.trim() || github?.owner || 'local';
+  const repository = store.createRepository({
+    provider: 'github', owner, name, url: input.url?.trim() || github?.url || `https://github.local/${owner}/${name}`,
+    defaultBranch: input.defaultBranch?.trim() || state.branch || 'main', localPath: input.localPath,
+  });
+  const project = store.createProject(String(repository.id), name, metadata as Record<string, unknown>);
   return { repository, project, git: state, scan: metadata };
+}
+
+export async function inspectProjectHealth(projectId: string) {
+  const { store, git } = controlPlane();
+  const project = store.getProject(projectId);
+  if (!project) throw new Error('Project not found');
+  const repository = store.getRepository(String((project as Record<string, unknown>).repositoryId));
+  if (!repository?.localPath) throw new Error('Project does not have a local path');
+  const metadata = (project.metadata ?? {}) as ProjectMetadata;
+  const commands = [metadata.lintCommand, metadata.testCommand, metadata.buildCommand].filter(
+    (command): command is string => typeof command === 'string' && command.trim().length > 0,
+  );
+  const gitState = await git.inspect(String(repository.localPath));
+  const results = commands.length
+    ? await new TesterAgent().verify(String(repository.localPath), { commands, requiresNewTests: false, rationale: 'Explicit project health inspection' })
+    : [];
+  return { project, repository, metadata, git: gitState, results };
+}
+
+const sensitivePath = /(^|\/)(\.env(?:\..*)?|credentials\.json|secrets\.|.*\.(pem|key))$/i;
+export async function publishProjectToGitHub(input: { projectId: string; name: string; private: boolean }) {
+  const { store, git } = controlPlane();
+  const token = githubToken();
+  if (!token) throw new Error('GitHub is not connected on this server');
+  const project = store.getProject(input.projectId);
+  if (!project) throw new Error('Project not found');
+  const repository = store.getRepository(String((project as Record<string, unknown>).repositoryId));
+  if (!repository?.localPath) throw new Error('Project does not have a local path');
+  const path = String(repository.localPath);
+  const state = await git.inspect(path);
+  if (state.detached || state.conflicts || state.dirty)
+    throw new Error('Publish requires a clean, attached, conflict-free local Git repository');
+  try {
+    await git.remoteUrl(path);
+    throw new Error('An origin remote already exists; CodexFlow will not replace it automatically');
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('will not replace')) throw error;
+  }
+  const tracked = (await git.listTrackedFiles(path)).stdout.split('\n').filter(Boolean);
+  if (tracked.some((file) => sensitivePath.test(file)))
+    throw new Error('Sensitive tracked files must be removed before publishing');
+  const provider = new GitHubProvider(token);
+  const created = await provider.createRepository({ name: input.name, private: input.private });
+  await git.addRemote(path, 'origin', created.cloneUrl);
+  await git.pushSetUpstream(path, 'origin', state.branch!);
+  const updated = store.updateRepository(String(repository.id), {
+    owner: created.owner, name: created.name, url: created.url, defaultBranch: created.defaultBranch,
+  });
+  return { repository: updated, remote: { owner: created.owner, name: created.name, url: created.url }, branch: state.branch };
 }
 
 export async function repositorySnapshot(repository: Record<string, unknown>) {

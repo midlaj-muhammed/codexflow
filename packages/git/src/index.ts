@@ -93,4 +93,16 @@ export class GitEngine {
   remoteBranchHead(path: string, remote = 'origin', branch: string) {
     return this.run(path, ['ls-remote', remote, `refs/heads/${branch}`]);
   }
+  remoteUrl(path: string, remote = 'origin') {
+    return this.run(path, ['remote', 'get-url', remote]);
+  }
+  listTrackedFiles(path: string) {
+    return this.run(path, ['ls-files']);
+  }
+  addRemote(path: string, remote: string, url: string) {
+    return this.run(path, ['remote', 'add', remote, url]);
+  }
+  pushSetUpstream(path: string, remote: string, branch: string) {
+    return this.run(path, ['push', '--set-upstream', remote, branch]);
+  }
 }

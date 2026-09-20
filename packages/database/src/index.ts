@@ -342,6 +342,14 @@ export class CodexFlowStore {
       )
       .get(id) as Record<string, unknown> | undefined;
   }
+  updateRepository(id: string, input: Pick<CreateRepository, 'owner' | 'name' | 'url' | 'defaultBranch'>) {
+    const value = createRepositorySchema.pick({ owner: true, name: true, url: true, defaultBranch: true }).parse(input);
+    const timestamp = now();
+    this.db
+      .prepare('UPDATE repositories SET owner = ?, name = ?, url = ?, default_branch = ?, updated_at = ? WHERE id = ?')
+      .run(value.owner, value.name, value.url, value.defaultBranch, timestamp, id);
+    return this.getRepository(id);
+  }
   listRepositories() {
     return this.db
       .prepare(

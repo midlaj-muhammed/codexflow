@@ -8,7 +8,7 @@ import { ApprovalService, CoreAgentPipeline, RiskEngine, TesterAgent } from '@co
 import { GitEngine } from '@codexflow/git';
 import { ProviderError, type GitProvider, type RemotePullRequest } from '@codexflow/providers';
 import { EventBus, TaskLifecycleManager } from '@codexflow/runtime';
-import { classifyDeliveryFailure, DeliveryService, type DeliveryRecord } from './index.js';
+import { classifyDeliveryFailure, DeliveryService, Reporter, type DeliveryRecord } from './index.js';
 
 function git(cwd: string, ...args: string[]) {
   return execFileSync('git', args, { cwd }).toString().trim();
@@ -136,6 +136,16 @@ function service(input: {
 }
 
 describe('DeliveryService durable delivery', () => {
+  it('builds a pull request description only from provided execution evidence', () => {
+    const delivery = record({ taskId: 'task-1', workspaceId: 'workspace-1', path: '/tmp', baseline: 'base' });
+    delivery.taskPrompt = 'Fix expired authentication sessions.';
+    delivery.agentRuns = [{ role: 'PLANNER', status: 'COMPLETED' }, { role: 'TESTER', status: 'COMPLETED' }];
+    const metadata = new Reporter().pr(delivery, [{ command: 'pnpm test', status: 'PASSED', exitCode: 0, stdout: '', stderr: '', durationMs: 10 }]);
+    expect(metadata.title).toBe('Fix expired authentication sessions');
+    expect(metadata.body).toContain('pnpm test: PASSED');
+    expect(metadata.body).toContain('PLANNER: COMPLETED');
+    expect(metadata.body).toContain('a.txt');
+  });
   it('refreshes persisted GitHub PR state and rejects a moved PR head', async () => {
     const { path, baseline } = fixture(true);
     const { db, store, task } = createStore();

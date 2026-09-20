@@ -39,6 +39,7 @@ export interface GitProvider {
   listRepositories(): Promise<RemoteRepository[]>;
   getRepository(owner: string, name: string): Promise<RemoteRepository>;
   listBranches(owner: string, name: string): Promise<string[]>;
+  createRepository?(input: { name: string; private: boolean }): Promise<RemoteRepository>;
   createPullRequest(input: {
     owner: string;
     name: string;
@@ -208,6 +209,14 @@ export class GitHubProvider implements GitProvider {
         ),
       )
       .map(({ name: branch }) => branch);
+  }
+  async createRepository(input: { name: string; private: boolean }) {
+    const value = z.object({ name: z.string().trim().min(1).max(100), private: z.boolean() }).parse(input);
+    return this.map(await this.request('/user/repos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: value.name, private: value.private, auto_init: false }),
+    }));
   }
   async createPullRequest(input: {
     owner: string;

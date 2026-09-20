@@ -35,6 +35,10 @@ export type DeliveryRecord = {
   pullRequest?: RemotePullRequest;
   /** Actual results from the final verification gate, never model assertions. */
   finalVerification?: TestExecution[];
+  /** Safe persisted execution context used only for an evidence-based PR description. */
+  taskPrompt?: string;
+  agentRuns?: Array<{ role: string; status: string }>;
+  reviewFindings?: unknown;
 };
 export type DeliveryRuntime = {
   lifecycle: Pick<TaskLifecycleManager, 'recordDeliveryState'>;
@@ -65,9 +69,19 @@ export class Reporter {
     const verification = results.length
       ? results.map((result) => `- ${result.command}: ${result.status}`).join('\n')
       : '- No persisted final-verification result is available for this delivery.';
+    const task = input.taskPrompt?.trim();
+    const title = task
+      ? task.replace(/[\r\n]+/g, ' ').replace(/[.?!]+$/, '').slice(0, 100)
+      : `CodexFlow: ${input.taskId}`;
+    const workflow = input.agentRuns?.length
+      ? input.agentRuns.map((run) => `- ${run.role}: ${run.status}`).join('\n')
+      : undefined;
+    const review = Array.isArray(input.reviewFindings) && input.reviewFindings.length
+      ? `\n\n## Review Notes\n${input.reviewFindings.map((finding) => `- ${typeof finding === 'string' ? finding : JSON.stringify(finding)}`).join('\n')}`
+      : '';
     return {
-      title: `CodexFlow: ${input.taskId}`,
-      body: `## Summary\n${input.taskId}\n\n## Verification\n${verification}\n\n## Risk\n${input.risk.level}: ${input.risk.reasons.join('; ')}\n\n## Changed Files\n${input.changedFiles.map((x) => `- ${x}`).join('\n')}\n\n## CodexFlow\nTask: ${input.taskId}\nCommit: ${input.commit?.sha ?? 'pending'}`,
+      title,
+      body: `## Summary\n${task ?? `Task ${input.taskId}`}\n\n## Task\n> ${task ?? 'Task prompt was not persisted for this delivery.'}\n\n## Verification\n${verification}\n\n## Risk\n${input.risk.level}: ${input.risk.reasons.join('; ') || 'No persisted risk reasons.'}\n\n## Changed Files\n${input.changedFiles.length ? input.changedFiles.map((x) => `- ${x}`).join('\n') : '- No changed-file metadata available.'}${workflow ? `\n\n## Agent Workflow\n${workflow}` : ''}${review}\n\n## CodexFlow\nTask: ${input.taskId}\nCommit: ${input.commit?.sha ?? 'pending'}`,
     };
   }
 }

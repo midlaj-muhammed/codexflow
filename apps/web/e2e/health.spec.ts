@@ -1,13 +1,15 @@
 import { expect, test } from '@playwright/test';
 
-test('shows developer control plane and health endpoint', async ({ page, request }) => {
+test('shows the public landing page, dashboard entry, and health endpoint', async ({ page, request }) => {
   await page.goto('/');
   await expect(
-    page.getByRole('heading', { name: /understand every agent change before it reaches github/i }),
+    page.getByRole('heading', { name: /ai coding agents\. under control\./i }),
   ).toBeVisible();
-  await expect(page.getByRole('heading', { name: /import a local repository/i })).toBeVisible();
-  await expect(page.getByRole('heading', { name: /^tasks$/i })).toBeVisible();
-  await expect(page.getByRole('heading', { name: /^operations$/i })).toBeVisible();
+  await expect(page.getByRole('link', { name: /open dashboard/i })).toBeVisible();
+  await page.goto('/app');
+  await expect(page.getByRole('heading', { name: /take a verified change from task to github/i })).toBeVisible();
+  await expect(page.getByRole('heading', { name: /open a local git project/i })).toBeVisible();
+  await expect(page.getByText(/import a local project or github clone before creating a task/i)).toBeVisible();
 
   const response = await request.get('/api/health');
   await expect(response).toBeOK();

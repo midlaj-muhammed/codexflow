@@ -25,6 +25,15 @@ describe('GitHubProvider', () => {
       expect.objectContaining({ provider: 'github', name: 'demo' }),
     ]);
   });
+  it('creates a repository through the authenticated server-side provider', async () => {
+    const provider = new GitHubProvider('secret-token', json({
+      id: 1, owner: { login: 'acme' }, name: 'new-project', html_url: 'https://github.com/acme/new-project',
+      clone_url: 'https://github.com/acme/new-project.git', default_branch: 'main', private: true,
+    }, 201) as typeof fetch);
+    await expect(provider.createRepository({ name: 'new-project', private: true })).resolves.toMatchObject({
+      owner: 'acme', name: 'new-project', private: true,
+    });
+  });
   it('maps authentication and availability failures to structured errors', async () => {
     await expect(
       new GitHubProvider('token', json({}, 401) as typeof fetch).listRepositories(),
