@@ -6,6 +6,7 @@ import { GitEngine } from '@codexflow/git';
 import { GitHubProvider } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 import { basename } from 'node:path';
+import { join } from 'node:path';
 
 type GlobalControlPlane = typeof globalThis & {
   __codexflowControlPlane?: {
@@ -40,18 +41,27 @@ function githubToken() {
   return process.env.CODEXFLOW_GITHUB_TOKEN ?? process.env.CODEXFLOW_GITHUB_E2E_TOKEN;
 }
 
-export async function githubConnection() {
-  const token = githubToken();
+export async function githubConnection(token = githubToken()) {
   if (!token) return { connected: false as const };
   const provider = new GitHubProvider(token);
   const account = await provider.authenticate(token);
   return { connected: true as const, login: account.login };
 }
 
-export async function githubRepositories() {
-  const token = githubToken();
+export async function githubRepositories(token = githubToken()) {
   if (!token) throw new Error('GitHub is not connected on this server');
   return new GitHubProvider(token).listRepositories();
+}
+export async function importGitHubRepository(input: { owner: string; name: string; token: string }) {
+  const { store, git } = controlPlane();
+  const remote = await new GitHubProvider(input.token).getRepository(input.owner, input.name);
+  const root = join(process.cwd(), '.codexflow', 'projects', `github-${remote.id}`);
+  if (!(await git.isRepository(root))) await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, input.token);
+  const state = await git.inspect(root);
+  const metadata = await scanProject(root);
+  const repository = store.createRepository({ provider: 'github', owner: remote.owner, name: remote.name, url: remote.url, defaultBranch: remote.defaultBranch, localPath: root });
+  const project = store.createProject(String(repository.id), remote.name, metadata as Record<string, unknown>);
+  return { repository, project, git: state, scan: metadata };
 }
 
 /** Starts the existing RuntimeExecutor and deliberately does not orchestrate agents in HTTP code. */
@@ -207,9 +217,9 @@ export async function inspectProjectHealth(projectId: string) {
 }
 
 const sensitivePath = /(^|\/)(\.env(?:\..*)?|credentials\.json|secrets\.|.*\.(pem|key))$/i;
-export async function publishProjectToGitHub(input: { projectId: string; name: string; private: boolean }) {
+export async function publishProjectToGitHub(input: { projectId: string; name: string; private: boolean; token?: string }) {
   const { store, git } = controlPlane();
-  const token = githubToken();
+  const token = input.token;
   if (!token) throw new Error('GitHub is not connected on this server');
   const project = store.getProject(input.projectId);
   if (!project) throw new Error('Project not found');
@@ -231,7 +241,7 @@ export async function publishProjectToGitHub(input: { projectId: string; name: s
   const provider = new GitHubProvider(token);
   const created = await provider.createRepository({ name: input.name, private: input.private });
   await git.addRemote(path, 'origin', created.cloneUrl);
-  await git.pushSetUpstream(path, 'origin', state.branch!);
+  await git.pushSetUpstreamAuthenticated(path, 'origin', state.branch!, token);
   const updated = store.updateRepository(String(repository.id), {
     owner: created.owner, name: created.name, url: created.url, defaultBranch: created.defaultBranch,
   });

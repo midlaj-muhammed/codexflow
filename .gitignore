@@ -11,3 +11,5 @@ test-results/
 .env.*.local
 !.env.example
 .codexflow/workspaces/
+.codexflow/projects/
+apps/web/.codexflow/

@@ -17,6 +17,15 @@ The dashboard shows persisted plans, agent runs, verification, risk, delivery,
 evaluation, and operational state. It is never authoritative for approval,
 Git, provider credentials, or lifecycle transitions.
 
+## Onboarding
+
+Open `/` to either continue with GitHub or import a local project. Interactive
+GitHub sign-in requires a GitHub OAuth App and the three server-only variables
+documented in `.env.example`; its callback is `/auth/github/callback`. Local
+folders are selected through the browser's File System Access API, copied into
+a CodexFlow-managed project source, and then executed only through isolated
+task worktrees. Chromium-based browsers are currently required for that picker.
+
 ## Development
 
 ```bash

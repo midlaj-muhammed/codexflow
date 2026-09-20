@@ -31,7 +31,7 @@ describe('CodexFlowStore', () => {
     });
     expect(workspace.taskId).toBe(task.id);
     expect(db.prepare('SELECT count(*) AS count FROM schema_migrations').get()).toMatchObject({
-      count: 8,
+      count: 9,
     });
   });
   it('persists fingerprint-bound approvals through the existing approvals table', () => {
@@ -60,6 +60,21 @@ describe('CodexFlowStore', () => {
       state: 'APPROVED',
       risk: { level: 'HIGH' },
     });
+  });
+  it('stores OAuth session metadata without treating a credential as task data', () => {
+    const store = new CodexFlowStore(openDatabase());
+    const id = store.createGitHubSession({
+      login: 'octocat',
+      tokenCiphertext: 'encrypted-token-fixture',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    });
+    expect(store.getGitHubSession(id)).toMatchObject({
+      id,
+      login: 'octocat',
+      tokenCiphertext: 'encrypted-token-fixture',
+    });
+    store.deleteGitHubSession(id);
+    expect(store.getGitHubSession(id)).toBeUndefined();
   });
   it('validates repository input and prevents empty task prompts', () => {
     const store = new CodexFlowStore(openDatabase());

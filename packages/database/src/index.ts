@@ -103,6 +103,15 @@ const migrations = [
   `ALTER TABLE delivery_pull_requests ADD COLUMN remote_status TEXT;
    ALTER TABLE delivery_pull_requests ADD COLUMN head_sha TEXT;
    ALTER TABLE delivery_pull_requests ADD COLUMN refreshed_at TEXT;`,
+  `CREATE TABLE IF NOT EXISTS github_sessions (
+    id TEXT PRIMARY KEY,
+    login TEXT NOT NULL,
+    avatar_url TEXT,
+    token_ciphertext TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+   CREATE INDEX IF NOT EXISTS github_sessions_expires ON github_sessions(expires_at);`,
 ];
 
 export type DeliveryStatus =
@@ -349,6 +358,19 @@ export class CodexFlowStore {
       .prepare('UPDATE repositories SET owner = ?, name = ?, url = ?, default_branch = ?, updated_at = ? WHERE id = ?')
       .run(value.owner, value.name, value.url, value.defaultBranch, timestamp, id);
     return this.getRepository(id);
+  }
+  createGitHubSession(input: { login: string; avatarUrl?: string; tokenCiphertext: string; expiresAt: string }) {
+    const id = randomUUID();
+    this.db.prepare('INSERT INTO github_sessions VALUES (?, ?, ?, ?, ?, ?)')
+      .run(id, input.login, input.avatarUrl ?? null, input.tokenCiphertext, input.expiresAt, now());
+    return id;
+  }
+  getGitHubSession(id: string) {
+    return this.db.prepare('SELECT id, login, avatar_url AS avatarUrl, token_ciphertext AS tokenCiphertext, expires_at AS expiresAt, created_at AS createdAt FROM github_sessions WHERE id = ?')
+      .get(id) as Record<string, unknown> | undefined;
+  }
+  deleteGitHubSession(id: string) {
+    this.db.prepare('DELETE FROM github_sessions WHERE id = ?').run(id);
   }
   listRepositories() {
     return this.db

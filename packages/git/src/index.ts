@@ -1,5 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 const exec = promisify(execFile);
 export class GitError extends Error {
   constructor(
@@ -104,5 +106,43 @@ export class GitEngine {
   }
   pushSetUpstream(path: string, remote: string, branch: string) {
     return this.run(path, ['push', '--set-upstream', remote, branch]);
+  }
+  async pushSetUpstreamAuthenticated(path: string, remote: string, branch: string, token: string) {
+    try {
+      await exec('git', ['push', '--set-upstream', remote, branch], {
+        cwd: path,
+        maxBuffer: 10_000_000,
+        timeout: this.timeoutMs,
+        // Keep an OAuth token out of remotes, command arguments, and process output.
+        env: {
+          ...process.env,
+          GIT_TERMINAL_PROMPT: '0',
+          GIT_CONFIG_COUNT: '1',
+          GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+          GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
+        },
+      });
+    } catch (error) {
+      const result = error as { stderr?: string; message: string };
+      throw new GitError('git push failed', result.stderr ?? result.message);
+    }
+  }
+  async initializeSnapshot(path: string, branch = 'main') {
+    await this.run(path, ['init', '-b', branch]);
+    await this.run(path, ['add', '--', '.']);
+    await this.run(path, ['-c', 'user.name=CodexFlow', '-c', 'user.email=codexflow@local.invalid', 'commit', '-m', 'Import local project']);
+    return this.inspect(path);
+  }
+  async cloneGitHubRepository(url: string, target: string, branch: string, token: string) {
+    await mkdir(dirname(target), { recursive: true });
+    try {
+      await exec('git', ['clone', '--branch', branch, '--single-branch', url, target], {
+        maxBuffer: 10_000_000, timeout: this.timeoutMs,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}` },
+      });
+    } catch (error) {
+      const result = error as { stderr?: string; message: string };
+      throw new GitError('git clone failed', result.stderr ?? result.message);
+    }
   }
 }
