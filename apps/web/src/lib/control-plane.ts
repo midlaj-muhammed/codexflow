@@ -6,7 +6,8 @@ import { GitEngine } from '@codexflow/git';
 import { GitHubProvider } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 import { basename } from 'node:path';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
+import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 
 type GlobalControlPlane = typeof globalThis & {
@@ -58,7 +59,17 @@ export async function importGitHubRepository(input: { owner: string; name: strin
   const remote = await new GitHubProvider(input.token).getRepository(input.owner, input.name);
   const projectsRoot = process.env.CODEXFLOW_PROJECT_ROOT ?? join(tmpdir(), 'codexflow', 'projects');
   const root = join(projectsRoot, `github-${remote.id}`);
-  if (!(await git.isRepository(root))) await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, input.token);
+  if (!(await git.isRepository(root))) {
+    // This directory is created exclusively from the authoritative GitHub
+    // repository ID. Removing an incomplete prior clone makes imports
+    // retryable without accepting a browser-controlled filesystem path.
+    const pathWithinProjectsRoot = relative(projectsRoot, root);
+    if (!pathWithinProjectsRoot || pathWithinProjectsRoot.startsWith('..')) {
+      throw new Error('Managed project path is outside the configured project root');
+    }
+    await rm(root, { recursive: true, force: true });
+    await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, input.token);
+  }
   const state = await git.inspect(root);
   const metadata = await scanProject(root);
   const repository = store.createRepository({ provider: 'github', owner: remote.owner, name: remote.name, url: remote.url, defaultBranch: remote.defaultBranch, localPath: root });

@@ -1,7 +1,8 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { mkdir, rename, rm } from 'node:fs/promises';
+import { dirname, basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 const exec = promisify(execFile);
 export class GitError extends Error {
   constructor(
@@ -10,6 +11,27 @@ export class GitError extends Error {
   ) {
     super(message);
   }
+}
+
+/**
+ * Keep provider credentials and HTTP headers out of errors returned through
+ * the control plane. The user still receives an actionable classification.
+ */
+export function describeGitCloneFailure(error: { code?: string; stderr?: string; message?: string }) {
+  const detail = `${error.stderr ?? ''}\n${error.message ?? ''}`.toLowerCase();
+  if (error.code === 'ENOENT' || /spawn git|enoent.*git/.test(detail)) {
+    return 'Git is unavailable in this runtime. Repository cloning requires a persistent runtime with the Git CLI installed.';
+  }
+  if (/authentication failed|could not read username|repository not found|http 401|http 403|permission denied.*github/.test(detail)) {
+    return 'GitHub rejected the clone request. Reconnect GitHub and confirm that your account can access this repository.';
+  }
+  if (/eacces|erofs|read-only file system|permission denied/.test(detail)) {
+    return 'The managed project workspace is not writable in this deployment. Configure a writable project root and retry.';
+  }
+  if (/timed out|etimedout|econnreset|enotfound|could not resolve host|network is unreachable/.test(detail)) {
+    return 'GitHub could not be reached while cloning the repository. Check network access and retry.';
+  }
+  return 'Git could not clone this repository. Retry the import; if it persists, verify GitHub access and the deployment runtime.';
 }
 export class GitEngine {
   constructor(private readonly timeoutMs = 60_000) {
@@ -134,15 +156,20 @@ export class GitEngine {
     return this.inspect(path);
   }
   async cloneGitHubRepository(url: string, target: string, branch: string, token: string) {
-    await mkdir(dirname(target), { recursive: true });
+    // A failed clone can leave a partial directory behind. Clone to a unique
+    // sibling first so a later retry is never blocked by partial state.
+    const staging = join(dirname(target), `.${basename(target)}.clone-${randomUUID()}`);
     try {
-      await exec('git', ['clone', '--branch', branch, '--single-branch', url, target], {
+      await mkdir(dirname(target), { recursive: true });
+      await exec('git', ['clone', '--branch', branch, '--single-branch', url, staging], {
         maxBuffer: 10_000_000, timeout: this.timeoutMs,
         env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}` },
       });
+      await rename(staging, target);
     } catch (error) {
       const result = error as { stderr?: string; message: string };
-      throw new GitError('git clone failed', result.stderr ?? result.message);
+      await rm(staging, { recursive: true, force: true }).catch(() => undefined);
+      throw new GitError(describeGitCloneFailure(result), result.stderr ?? result.message);
     }
   }
 }
