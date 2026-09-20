@@ -17,25 +17,57 @@ export class GitError extends Error {
  * Keep provider credentials and HTTP headers out of errors returned through
  * the control plane. The user still receives an actionable classification.
  */
-export function describeGitCloneFailure(error: { code?: string; stderr?: string; message?: string }) {
+export function describeGitCloneFailure(error: {
+  code?: string;
+  stderr?: string;
+  message?: string;
+}) {
   const detail = `${error.stderr ?? ''}\n${error.message ?? ''}`.toLowerCase();
   if (error.code === 'ENOENT' || /spawn git|enoent.*git/.test(detail)) {
     return 'Git is unavailable in this runtime. Repository cloning requires a persistent runtime with the Git CLI installed.';
   }
-  if (/authentication failed|could not read username|repository not found|http 401|http 403|permission denied.*github/.test(detail)) {
+  if (
+    /authentication failed|invalid username or token|could not read (username|password)|repository not found|http 401|http 403|permission denied.*github/.test(
+      detail,
+    )
+  ) {
     return 'GitHub rejected the clone request. Reconnect GitHub and confirm that your account can access this repository.';
   }
   if (/eacces|erofs|read-only file system|permission denied/.test(detail)) {
     return 'The managed project workspace is not writable in this deployment. Configure a writable project root and retry.';
   }
-  if (/timed out|etimedout|econnreset|enotfound|could not resolve host|network is unreachable/.test(detail)) {
+  if (
+    /timed out|etimedout|econnreset|enotfound|could not resolve host|network is unreachable/.test(
+      detail,
+    )
+  ) {
     return 'GitHub could not be reached while cloning the repository. Check network access and retry.';
   }
   return 'Git could not clone this repository. Retry the import; if it persists, verify GitHub access and the deployment runtime.';
 }
+
+/**
+ * GitHub's smart-HTTP Git endpoints use Basic authentication, unlike the REST
+ * API's Bearer-token convention. Supplying it through Git's temporary config
+ * keeps the OAuth token out of remote URLs, process arguments, and output.
+ */
+export function githubGitAuthorizationHeader(token: string) {
+  return `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`;
+}
+
+function githubGitEnvironment(token: string) {
+  return {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+    GIT_CONFIG_VALUE_0: githubGitAuthorizationHeader(token),
+  };
+}
 export class GitEngine {
   constructor(private readonly timeoutMs = 60_000) {
-    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('Git timeout must be positive');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+      throw new Error('Git timeout must be positive');
   }
   private async run(cwd: string, args: string[]) {
     try {
@@ -136,13 +168,7 @@ export class GitEngine {
         maxBuffer: 10_000_000,
         timeout: this.timeoutMs,
         // Keep an OAuth token out of remotes, command arguments, and process output.
-        env: {
-          ...process.env,
-          GIT_TERMINAL_PROMPT: '0',
-          GIT_CONFIG_COUNT: '1',
-          GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
-          GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}`,
-        },
+        env: githubGitEnvironment(token),
       });
     } catch (error) {
       const result = error as { stderr?: string; message: string };
@@ -152,7 +178,15 @@ export class GitEngine {
   async initializeSnapshot(path: string, branch = 'main') {
     await this.run(path, ['init', '-b', branch]);
     await this.run(path, ['add', '--', '.']);
-    await this.run(path, ['-c', 'user.name=CodexFlow', '-c', 'user.email=codexflow@local.invalid', 'commit', '-m', 'Import local project']);
+    await this.run(path, [
+      '-c',
+      'user.name=CodexFlow',
+      '-c',
+      'user.email=codexflow@local.invalid',
+      'commit',
+      '-m',
+      'Import local project',
+    ]);
     return this.inspect(path);
   }
   async cloneGitHubRepository(url: string, target: string, branch: string, token: string) {
@@ -162,8 +196,9 @@ export class GitEngine {
     try {
       await mkdir(dirname(target), { recursive: true });
       await exec('git', ['clone', '--branch', branch, '--single-branch', url, staging], {
-        maxBuffer: 10_000_000, timeout: this.timeoutMs,
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader', GIT_CONFIG_VALUE_0: `Authorization: Bearer ${token}` },
+        maxBuffer: 10_000_000,
+        timeout: this.timeoutMs,
+        env: githubGitEnvironment(token),
       });
       await rename(staging, target);
     } catch (error) {
