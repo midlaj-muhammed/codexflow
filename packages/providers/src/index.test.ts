@@ -1,10 +1,65 @@
 import { describe, expect, it } from 'vitest';
-import { createHmac } from 'node:crypto';
-import { GitHubProvider, ProviderError, verifyGitHubWebhookSignature } from './index.js';
+import { createHmac, generateKeyPairSync } from 'node:crypto';
+import {
+  createGitHubAppJwt,
+  GitHubAppAuth,
+  GitHubProvider,
+  ProviderError,
+  verifyGitHubWebhookSignature,
+} from './index.js';
 const json =
   (data: unknown, status = 200) =>
   async () =>
     new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+
+describe('GitHubAppAuth', () => {
+  it('creates a signed GitHub App JWT', () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const jwt = createGitHubAppJwt({
+      appId: '12345',
+      privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      now: new Date('2026-09-20T00:00:00Z'),
+    });
+    const [header, payload, signature] = jwt.split('.');
+    expect(JSON.parse(Buffer.from(header, 'base64url').toString('utf8'))).toMatchObject({
+      alg: 'RS256',
+      typ: 'JWT',
+    });
+    expect(JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'))).toMatchObject({
+      iss: '12345',
+    });
+    expect(signature).toBeTruthy();
+  });
+
+  it('mints an installation token for a repository', async () => {
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const paths: string[] = [];
+    const appAuth = new GitHubAppAuth(
+      '12345',
+      privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+      async (input, init) => {
+        paths.push(`${String(init?.method ?? 'GET')} ${String(input)}`);
+        if (String(input).endsWith('/repos/acme/demo/installation'))
+          return new Response(JSON.stringify({ id: 99 }));
+        expect(String(input)).toContain('/app/installations/99/access_tokens');
+        expect(init?.method).toBe('POST');
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          repositories: ['demo'],
+          permissions: { contents: 'write', pull_requests: 'write' },
+        });
+        return new Response(JSON.stringify({ token: 'installation-token' }));
+      },
+    );
+    await expect(appAuth.createRepositoryInstallationToken('acme', 'demo')).resolves.toBe(
+      'installation-token',
+    );
+    expect(paths).toEqual([
+      'GET https://api.github.com/repos/acme/demo/installation',
+      'POST https://api.github.com/app/installations/99/access_tokens',
+    ]);
+  });
+});
+
 describe('GitHubProvider', () => {
   it('lists and maps repositories without retaining a token in results', async () => {
     const provider = new GitHubProvider(

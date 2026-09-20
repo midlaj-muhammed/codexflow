@@ -279,6 +279,11 @@ authenticated session; `/api/github/import` creates a managed clone using the
 GitHub provider and Git engine. A user does not need to type a server filesystem
 path for the GitHub repository workflow.
 
+When OAuth is backed by a GitHub App, CodexFlow uses the signed-in user session
+for repository selection and mints a short-lived GitHub App installation token
+for the actual Git clone/import. That requires `GITHUB_APP_ID` plus a server-only
+GitHub App private key in the deployment environment.
+
 **Deployment qualification:** OAuth code is implemented, but it requires
 `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and
 `CODEXFLOW_SESSION_SECRET` on a compatible persistent host. The Vercel public
@@ -466,23 +471,26 @@ in development).
 Start with [`.env.example`](.env.example). It contains placeholders only;
 never commit real values.
 
-| Variable                     | Required when                          | Purpose                                                                                |
-| ---------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------- |
-| `NEXT_PUBLIC_APP_NAME`       | Optional                               | Public application name; no secret belongs in this variable.                           |
-| `OPENAI_API_KEY`             | Running real provider-backed tasks     | Server-only OpenAI credential for RuntimeExecutor.                                     |
-| `CODEXFLOW_DATABASE_PATH`    | Durable production deployment          | SQLite control-plane database location.                                                |
-| `CODEXFLOW_PROJECT_ROOT`     | Durable production deployment          | Root for managed source projects.                                                      |
-| `CODEXFLOW_WORKSPACE_ROOT`   | Durable production deployment          | Root for task worktrees.                                                               |
-| `CODEXFLOW_GITHUB_TOKEN`     | A configured delivery flow requires it | Server-managed GitHub delivery credential.                                             |
-| `GITHUB_OAUTH_CLIENT_ID`     | Interactive GitHub sign-in             | GitHub OAuth app client ID.                                                            |
-| `GITHUB_OAUTH_CLIENT_SECRET` | Interactive GitHub sign-in             | GitHub OAuth app client secret; server-only.                                           |
-| `CODEXFLOW_SESSION_SECRET`   | Interactive GitHub sign-in             | Long random server-side session/encryption secret.                                     |
-| `CODEXFLOW_PUBLIC_URL`       | OAuth behind a reverse proxy           | Exact public GitHub-registered origin; prevents use of an internal listener URL.       |
-| `GITHUB_APP_SLUG`            | GitHub App OAuth deployments           | Public GitHub App slug used to open the install flow when no installation exists.      |
-| `GITHUB_APP_INSTALL_URL`     | GitHub App OAuth deployments           | Optional explicit GitHub App install URL; overrides the slug-derived URL.              |
-| `DATABASE_URL`               | PostgreSQL-backed OAuth sessions       | PostgreSQL/Supabase connection URL for encrypted OAuth session rows only.              |
-| `CODEXFLOW_REAL_OPENAI_E2E`  | Real OpenAI E2E                        | Explicit opt-in for the external provider suite.                                       |
-| `CODEXFLOW_GITHUB_E2E_*`     | Real GitHub delivery E2E               | Disposable repository, token, and workspace configuration described in `.env.example`. |
+| Variable                        | Required when                          | Purpose                                                                                |
+| ------------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------- |
+| `NEXT_PUBLIC_APP_NAME`          | Optional                               | Public application name; no secret belongs in this variable.                           |
+| `OPENAI_API_KEY`                | Running real provider-backed tasks     | Server-only OpenAI credential for RuntimeExecutor.                                     |
+| `CODEXFLOW_DATABASE_PATH`       | Durable production deployment          | SQLite control-plane database location.                                                |
+| `CODEXFLOW_PROJECT_ROOT`        | Durable production deployment          | Root for managed source projects.                                                      |
+| `CODEXFLOW_WORKSPACE_ROOT`      | Durable production deployment          | Root for task worktrees.                                                               |
+| `CODEXFLOW_GITHUB_TOKEN`        | A configured delivery flow requires it | Server-managed GitHub delivery credential.                                             |
+| `GITHUB_OAUTH_CLIENT_ID`        | Interactive GitHub sign-in             | GitHub OAuth app client ID.                                                            |
+| `GITHUB_OAUTH_CLIENT_SECRET`    | Interactive GitHub sign-in             | GitHub OAuth app client secret; server-only.                                           |
+| `CODEXFLOW_SESSION_SECRET`      | Interactive GitHub sign-in             | Long random server-side session/encryption secret.                                     |
+| `CODEXFLOW_PUBLIC_URL`          | OAuth behind a reverse proxy           | Exact public GitHub-registered origin; prevents use of an internal listener URL.       |
+| `GITHUB_APP_SLUG`               | GitHub App OAuth deployments           | Public GitHub App slug used to open the install flow when no installation exists.      |
+| `GITHUB_APP_INSTALL_URL`        | GitHub App OAuth deployments           | Optional explicit GitHub App install URL; overrides the slug-derived URL.              |
+| `GITHUB_APP_ID`                 | GitHub App managed clone/import        | Numeric GitHub App ID used to mint short-lived installation tokens.                    |
+| `GITHUB_APP_PRIVATE_KEY`        | GitHub App managed clone/import        | Server-only GitHub App private key PEM; use escaped newlines if needed.                |
+| `GITHUB_APP_PRIVATE_KEY_BASE64` | GitHub App managed clone/import        | Alternative base64-encoded private key PEM for hosted environment variables.           |
+| `DATABASE_URL`                  | PostgreSQL-backed OAuth sessions       | PostgreSQL/Supabase connection URL for encrypted OAuth session rows only.              |
+| `CODEXFLOW_REAL_OPENAI_E2E`     | Real OpenAI E2E                        | Explicit opt-in for the external provider suite.                                       |
+| `CODEXFLOW_GITHUB_E2E_*`        | Real GitHub delivery E2E               | Disposable repository, token, and workspace configuration described in `.env.example`. |
 
 OAuth callback routes use the deployment origin:
 

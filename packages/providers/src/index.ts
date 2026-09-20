@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import type { Provider } from '@codexflow/shared';
 
 export type RemoteRepository = {
@@ -120,6 +120,31 @@ const installationsSchema = z.object({
 const installationRepositoriesSchema = z.object({
   repositories: z.array(z.unknown()),
 });
+const repositoryInstallationSchema = z.object({ id: z.number() });
+const installationAccessTokenSchema = z.object({ token: z.string().min(1) });
+
+function base64Url(input: string | Buffer) {
+  return Buffer.from(input).toString('base64url');
+}
+
+export function createGitHubAppJwt(input: { appId: string; privateKey: string; now?: Date }) {
+  const appId = input.appId.trim();
+  if (!appId) throw new ProviderError('VALIDATION', 'GitHub App ID is required');
+  if (!input.privateKey.trim())
+    throw new ProviderError('VALIDATION', 'GitHub App private key is required');
+  const nowSeconds = Math.floor((input.now?.getTime() ?? Date.now()) / 1000);
+  const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64Url(
+    JSON.stringify({
+      iat: nowSeconds - 60,
+      exp: nowSeconds + 9 * 60,
+      iss: appId,
+    }),
+  );
+  const body = `${header}.${payload}`;
+  const signature = createSign('RSA-SHA256').update(body).sign(input.privateKey, 'base64url');
+  return `${body}.${signature}`;
+}
 
 /**
  * Verifies GitHub's sha256 webhook signature without ever logging the secret
@@ -137,6 +162,75 @@ export function verifyGitHubWebhookSignature(
   const expectedBytes = Buffer.from(expected);
   return actualBytes.length === expectedBytes.length && timingSafeEqual(actualBytes, expectedBytes);
 }
+
+export class GitHubAppAuth {
+  constructor(
+    private readonly appId: string,
+    private readonly privateKey: string,
+    private readonly fetcher: typeof fetch = fetch,
+    private readonly timeoutMs = 30_000,
+  ) {
+    if (!appId.trim()) throw new ProviderError('VALIDATION', 'GitHub App ID is required');
+    if (!privateKey.trim())
+      throw new ProviderError('VALIDATION', 'GitHub App private key is required');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0)
+      throw new ProviderError('VALIDATION', 'GitHub timeout must be positive');
+  }
+
+  private async request(path: string, init?: RequestInit) {
+    const jwt = createGitHubAppJwt({ appId: this.appId, privateKey: this.privateKey });
+    let response: Response;
+    try {
+      response = await this.fetcher(`https://api.github.com${path}`, {
+        ...init,
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${jwt}`,
+          'X-GitHub-Api-Version': '2022-11-28',
+          ...init?.headers,
+        },
+        signal: init?.signal ?? AbortSignal.timeout(this.timeoutMs),
+      });
+    } catch {
+      throw new ProviderError('UNAVAILABLE', 'GitHub is unavailable');
+    }
+    if (!response.ok) {
+      const code =
+        response.status === 401 || response.status === 403
+          ? 'AUTH_FAILED'
+          : response.status === 404
+            ? 'NOT_FOUND'
+            : response.status >= 500
+              ? 'UNAVAILABLE'
+              : 'UNKNOWN';
+      throw new ProviderError(code, `GitHub App request failed (${response.status})`);
+    }
+    return response.json() as Promise<unknown>;
+  }
+
+  async createRepositoryInstallationToken(owner: string, name: string) {
+    const installation = repositoryInstallationSchema.parse(
+      await this.request(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/installation`,
+      ),
+    );
+    const token = installationAccessTokenSchema.parse(
+      await this.request(`/app/installations/${installation.id}/access_tokens`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repositories: [name],
+          permissions: {
+            contents: 'write',
+            pull_requests: 'write',
+          },
+        }),
+      }),
+    );
+    return token.token;
+  }
+}
+
 export class GitHubProvider implements GitProvider {
   constructor(
     private readonly token: string,

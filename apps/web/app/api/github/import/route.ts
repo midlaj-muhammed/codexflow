@@ -8,7 +8,10 @@ export async function POST(request: Request) {
   try {
     const session = await currentGitHubSession();
     if (!session) throw new Error('Sign in with GitHub before importing a repository');
-    return NextResponse.json(await importGitHubRepository({ ...input.parse(await request.json()), token: session.token }), { status: 201 });
+    return NextResponse.json(
+      await importGitHubRepository({ ...input.parse(await request.json()), token: session.token }),
+      { status: 201 },
+    );
   } catch (error) {
     if (
       error instanceof Error &&

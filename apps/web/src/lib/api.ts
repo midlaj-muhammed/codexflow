@@ -27,6 +27,7 @@ export function apiError(error: unknown) {
         : /not found/i.test(message)
           ? 404
           : 422;
-  const classification = status === 409 ? 'RETRYABLE' : status === 422 ? 'BLOCKED' : 'PERMANENT_FAILURE';
+  const classification =
+    status === 409 ? 'RETRYABLE' : status === 422 ? 'BLOCKED' : 'PERMANENT_FAILURE';
   return NextResponse.json({ error: { message, code, classification, details } }, { status });
 }

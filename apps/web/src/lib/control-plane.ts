@@ -3,7 +3,7 @@ import { CodexFlowStore, openDatabase } from '@codexflow/database';
 import { DeliveryService, type DeliveryRecord } from '@codexflow/delivery';
 import { calculateEvaluationMetrics, ensureStarterBenchmark } from '@codexflow/evaluation';
 import { GitEngine } from '@codexflow/git';
-import { GitHubProvider, ProviderError } from '@codexflow/providers';
+import { GitHubAppAuth, GitHubProvider, ProviderError } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 import { basename } from 'node:path';
 import { join, relative } from 'node:path';
@@ -58,6 +58,38 @@ function githubToken() {
   return process.env.CODEXFLOW_GITHUB_TOKEN ?? process.env.CODEXFLOW_GITHUB_E2E_TOKEN;
 }
 
+function githubAppPrivateKey(environment: Record<string, string | undefined> = process.env) {
+  const encoded = environment.GITHUB_APP_PRIVATE_KEY_BASE64?.trim();
+  if (encoded) return Buffer.from(encoded, 'base64').toString('utf8');
+  return environment.GITHUB_APP_PRIVATE_KEY?.replace(/\\n/g, '\n');
+}
+
+async function githubCloneToken(input: { owner: string; name: string; userToken: string }) {
+  const appId = process.env.GITHUB_APP_ID?.trim();
+  const privateKey = githubAppPrivateKey();
+  if (appId && privateKey) {
+    try {
+      return await new GitHubAppAuth(appId, privateKey).createRepositoryInstallationToken(
+        input.owner,
+        input.name,
+      );
+    } catch (error) {
+      if (error instanceof ProviderError && ['AUTH_FAILED', 'NOT_FOUND'].includes(error.code)) {
+        throw new Error(
+          'CodexFlow could not mint a GitHub App installation token for this repository. Confirm the GitHub App ID, private key, installation, and Repository contents permission in Render and GitHub.',
+        );
+      }
+      throw error;
+    }
+  }
+  if (input.userToken.startsWith('ghu_')) {
+    throw new Error(
+      'GitHub repository cloning for a GitHub App login requires GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY or GITHUB_APP_PRIVATE_KEY_BASE64 on the server. Add the GitHub App private key in Render, redeploy, then reconnect GitHub.',
+    );
+  }
+  return input.userToken;
+}
+
 export async function githubConnection(token = githubToken()) {
   if (!token) return { connected: false as const };
   const provider = new GitHubProvider(token);
@@ -98,7 +130,12 @@ export async function importGitHubRepository(input: {
       throw new Error('Managed project path is outside the configured project root');
     }
     await rm(root, { recursive: true, force: true });
-    await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, input.token);
+    const cloneToken = await githubCloneToken({
+      owner: input.owner,
+      name: input.name,
+      userToken: input.token,
+    });
+    await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, cloneToken);
   }
   const state = await git.inspect(root);
   const metadata = await scanProject(root);

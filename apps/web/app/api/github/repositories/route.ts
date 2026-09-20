@@ -10,10 +10,7 @@ export async function GET() {
     if (!session) throw new Error('Sign in with GitHub before browsing repositories');
     return NextResponse.json({ repositories: await githubRepositories(session.token) });
   } catch (error) {
-    if (
-      error instanceof ProviderError &&
-      error.message.includes('Install the GitHub App')
-    ) {
+    if (error instanceof ProviderError && error.message.includes('Install the GitHub App')) {
       const installUrl = githubAppInstallUrl();
       return apiError(
         new ApiActionError(

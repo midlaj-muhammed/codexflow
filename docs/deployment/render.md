@@ -61,6 +61,8 @@ CODEXFLOW_PUBLIC_URL=https://YOUR-RENDER-SERVICE.onrender.com
 GITHUB_APP_SLUG=<your-github-app-slug>
 # or:
 GITHUB_APP_INSTALL_URL=https://github.com/apps/<your-github-app-slug>/installations/new
+GITHUB_APP_ID=<numeric GitHub App ID>
+GITHUB_APP_PRIVATE_KEY_BASE64=<base64-encoded GitHub App private key PEM>
 ```
 
 `DATABASE_URL` currently persists encrypted GitHub OAuth sessions. The main
@@ -85,6 +87,13 @@ Set either `GITHUB_APP_SLUG` or `GITHUB_APP_INSTALL_URL` in Render. When a
 signed-in user has authorized the app but has not installed it on any accessible
 account or repository, CodexFlow will show an **Install GitHub App** action that
 opens GitHub's installation flow.
+
+Set `GITHUB_APP_ID` and either `GITHUB_APP_PRIVATE_KEY` or
+`GITHUB_APP_PRIVATE_KEY_BASE64` for managed clone/import. The OAuth user token
+is used for the user session and repository selection; CodexFlow mints a
+short-lived GitHub App installation token for the actual Git clone so GitHub's
+repository installation permissions remain authoritative. The private key is a
+server-only secret and must never be committed.
 
 Only add `CODEXFLOW_GITHUB_TOKEN` when the configured delivery flow requires
 a server-managed GitHub credential. OAuth tokens are encrypted server-side and
