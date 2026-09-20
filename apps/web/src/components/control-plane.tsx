@@ -22,6 +22,7 @@ type TaskDetail = {
 type EvaluationSummary = { benchmarks: Array<Json & { taskCount: number }>; runs: Json[]; metrics: Json };
 type Operations = { tasks: { total: number; failed: number; byState: Json }; agents: { total: number; failed: number }; execution: { activeLeases: number; reclaimedStaleLeases: number } };
 type GitHubConnection = { connected: boolean; login?: string };
+type UiError = { message: string; action?: string; installUrl?: string };
 
 const statusClass = (value: unknown) => `status status-${String(value ?? 'UNKNOWN').toLowerCase()}`;
 const text = (value: unknown, fallback = 'Not available') =>
@@ -30,18 +31,32 @@ const text = (value: unknown, fallback = 'Not available') =>
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } });
   const raw = await response.text();
-  let body: (T & { error?: { message?: string } }) | undefined;
+  let body: (T & { error?: { message?: string; details?: Json } }) | undefined;
   if (raw) {
-    try { body = JSON.parse(raw) as T & { error?: { message?: string } }; }
+    try { body = JSON.parse(raw) as T & { error?: { message?: string; details?: Json } }; }
     catch { throw new Error(`Server returned invalid JSON for ${path} (HTTP ${response.status}). Check the server logs.`); }
   }
-  if (!response.ok) throw new Error(body?.error?.message ?? `Request failed for ${path} (HTTP ${response.status}). Check the server logs.`);
+  if (!response.ok) {
+    const error = new Error(body?.error?.message ?? `Request failed for ${path} (HTTP ${response.status}). Check the server logs.`) as Error & { details?: Json };
+    error.details = body?.error?.details;
+    throw error;
+  }
   if (!body) throw new Error(`Server returned an empty response for ${path} (HTTP ${response.status}). Check the server logs.`);
   return body;
 }
 
 function Empty({ children }: { children: ReactNode }) {
   return <p className="empty">{children}</p>;
+}
+
+function uiError(cause: unknown, fallback: string): UiError {
+  if (!(cause instanceof Error)) return { message: fallback };
+  const details = (cause as Error & { details?: Json }).details;
+  return {
+    message: cause.message,
+    action: typeof details?.action === 'string' ? details.action : undefined,
+    installUrl: typeof details?.installUrl === 'string' ? details.installUrl : undefined,
+  };
 }
 
 function Detail({ detail, onUpdate, onError }: { detail: TaskDetail; onUpdate: (task: TaskDetail) => void; onError: (error: string) => void }) {
@@ -95,7 +110,7 @@ export function ControlPlane() {
   const [evaluation, setEvaluation] = useState<EvaluationSummary>();
   const [operations, setOperations] = useState<Operations>();
   const [detail, setDetail] = useState<TaskDetail>();
-  const [error, setError] = useState<string>();
+  const [error, setError] = useState<UiError>();
   const [busy, setBusy] = useState(false);
   const [selectedProject, setSelectedProject] = useState('');
   const [github, setGithub] = useState<GitHubConnection>({ connected: false });
@@ -120,7 +135,7 @@ export function ControlPlane() {
       setEvaluation(evaluationResult);
       setOperations(operationsResult.operations);
       setGithub(githubResult.github);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load control-plane data'); }
+    } catch (cause) { setError(uiError(cause, 'Unable to load control-plane data')); }
   }, []);
   useEffect(() => {
     const initialLoad = window.setTimeout(() => void refresh(), 0);
@@ -144,7 +159,7 @@ export function ControlPlane() {
       const result = await request<{ project: Json }>('/api/repositories/import', { method: 'POST', body: JSON.stringify({ localPath: form.get('localPath') }) });
       setSelectedProject(String(result.project.id));
       target.reset(); await refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Import failed'); } finally { setBusy(false); }
+    } catch (cause) { setError(uiError(cause, 'Import failed')); } finally { setBusy(false); }
   }
   async function createTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(undefined);
@@ -153,14 +168,14 @@ export function ControlPlane() {
     try {
       const result = await request<{ task: TaskDetail }>('/api/tasks', { method: 'POST', body: JSON.stringify({ projectId: form.get('projectId'), description: form.get('description') }) });
       setDetail(result.task); target.reset(); await refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Task creation failed'); } finally { setBusy(false); }
+    } catch (cause) { setError(uiError(cause, 'Task creation failed')); } finally { setBusy(false); }
   }
   async function loadGitHubRepositories() {
     try {
       setBusy(true); setError(undefined);
       const result = await request<{ repositories: Json[] }>('/api/github/repositories');
       setGithubRepositories(result.repositories);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'GitHub repositories could not be loaded'); } finally { setBusy(false); }
+    } catch (cause) { setError(uiError(cause, 'GitHub repositories could not be loaded')); } finally { setBusy(false); }
   }
   async function importSelectedGitHubRepository() {
     if (!selectedGitHubRepository) return;
@@ -168,26 +183,26 @@ export function ControlPlane() {
       setBusy(true); setError(undefined);
       const result = await request<{ project: Json }>('/api/github/import', { method: 'POST', body: JSON.stringify({ owner: selectedGitHubRepository.owner, name: selectedGitHubRepository.name }) });
       setSelectedProject(String(result.project.id)); setSelectedGitHubRepository(undefined); await refresh();
-    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Repository import failed'); } finally { setBusy(false); }
+    } catch (cause) { setError(uiError(cause, 'Repository import failed')); } finally { setBusy(false); }
   }
   async function runHealth(projectId: string) {
     try { setBusy(true); setError(undefined); setHealth((await request<{ health: Json }>(`/api/projects/${projectId}/health`, { method: 'POST' })).health); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'Project health inspection failed'); } finally { setBusy(false); }
+    catch (cause) { setError(uiError(cause, 'Project health inspection failed')); } finally { setBusy(false); }
   }
   async function publishProject(projectId: string, projectName: string) {
     const name = window.prompt('GitHub repository name', projectName);
     if (!name) return;
     try { setBusy(true); setError(undefined); await request(`/api/projects/${projectId}/publish`, { method: 'POST', body: JSON.stringify({ name, private: true }) }); await refresh(); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'Project publication failed'); } finally { setBusy(false); }
+    catch (cause) { setError(uiError(cause, 'Project publication failed')); } finally { setBusy(false); }
   }
   async function openTask(id: string) {
-    try { setDetail((await request<{ task: TaskDetail }>(`/api/tasks/${id}`)).task); } catch (cause) { setError(cause instanceof Error ? cause.message : 'Unable to load task'); }
+    try { setDetail((await request<{ task: TaskDetail }>(`/api/tasks/${id}`)).task); } catch (cause) { setError(uiError(cause, 'Unable to load task')); }
   }
   const active = useMemo(() => tasks.filter((task) => !['APPLIED', 'REJECTED', 'CANCELLED', 'FAILED'].includes(String(task.status))).length, [tasks]);
   return <main className="shell">
     <header className="topbar"><Link className="brand" href="/">CODEX<span>FLOW</span></Link><nav><a href="#projects">Projects</a><a href="#tasks">Tasks</a><a href="#evaluation">Evaluations</a><a href="#operations">Operations</a></nav><div className="account-status">{github.connected ? <>GitHub <strong>@{github.login}</strong> <span className="status status-passed">CONNECTED</span></> : <span className="subtle">GitHub not connected</span>}</div><button className="button secondary" onClick={() => void refresh()} disabled={busy}>Refresh</button></header>
     <section className="hero" id="top"><p className="eyebrow">DEVELOPER CONTROL PLANE</p><h1>Take a verified change from task to GitHub.</h1><p>Select a project, describe the outcome you want, then inspect every persisted plan, agent result, review, test, risk, and delivery checkpoint.</p><div className="actions"><a className="button" href="#new-task">New task</a><a className="button secondary" href="#local-project">Import project</a>{github.connected ? <button className="button secondary" onClick={() => void loadGitHubRepositories()} disabled={busy}>Browse GitHub</button> : null}</div><div className="metrics"><div><strong>{repositories.length}</strong><span>repositories</span></div><div><strong>{projects.length}</strong><span>projects</span></div><div><strong>{active}</strong><span>active tasks</span></div></div></section>
-    {error && <section className="notice" role="alert"><strong>Action blocked.</strong> {error}</section>}
+    {error && <section className="notice" role="alert"><strong>Action blocked.</strong> {error.message}{error.installUrl ? <div className="actions"><a className="button secondary" href={error.installUrl} target="_blank" rel="noreferrer">Install GitHub App</a><a className="button secondary" href="/auth/github/disconnect">Reconnect after install</a></div> : null}</section>}
     <section className="workflow" aria-label="CodexFlow workflow">{['Repository','Scan','Task','Agents','Review','Verify','Approve','Deliver','PR'].map((step) => <span key={step}>{step}</span>)}</section>
     <section className="split" id="projects"><article className="card" id="local-project"><p className="eyebrow">LOCAL PROJECT</p><h2>Open a project from this computer</h2><p className="subtle">Selected source files are copied into a CodexFlow-managed project workspace. Agents still receive separate task worktrees; your original folder is never modified.</p><LocalFolderPicker onImported={(projectId, summary) => { setSelectedProject(projectId); setError(undefined); void refresh(); setHealth({ importSummary: summary }); }} /><details><summary>Advanced: server-accessible Git checkout</summary><form onSubmit={importRepository} className="form"><label htmlFor="local-path">Server path</label><input id="local-path" name="localPath" placeholder="/absolute/path/to/project" required /><button className="button secondary" disabled={busy}>Import existing checkout</button></form></details></article><article className="card" id="new-task"><p className="eyebrow">NEW TASK</p><h2>What do you want CodexFlow to change?</h2><p className="subtle">The exact task text is persisted and becomes the runtime prompt.</p>{projects.length ? <form onSubmit={createTask} className="form"><label htmlFor="project">Project</label><select id="project" name="projectId" value={selectedProject || String(projects[0]?.id ?? '')} onChange={(event) => setSelectedProject(event.target.value)}>{projects.map((project) => <option key={String(project.id)} value={String(project.id)}>{String(project.name)}</option>)}</select><label htmlFor="task-prompt">Task</label><textarea id="task-prompt" name="description" placeholder="Fix the failing authentication tests and handle expired sessions correctly." minLength={3} maxLength={10_000} required /><button className="button" disabled={busy}>Start task</button></form> : <Empty>Open a local project or connect GitHub before creating a task.</Empty>}</article></section>
     {github.connected ? <section className="card"><p className="eyebrow">GITHUB</p><h2>Connect a repository</h2><p className="subtle">Connected as @{github.login}. Repository identity is read from GitHub and cloned into a CodexFlow-managed source workspace; credentials never reach this browser.</p><button className="button secondary" onClick={() => void loadGitHubRepositories()} disabled={busy}>Load repositories</button>{githubRepositories.length ? <div className="table">{githubRepositories.map((repo) => <button className="row task-row" type="button" key={String(repo.id)} onClick={() => setSelectedGitHubRepository(repo)}><div><strong>{String(repo.owner)}/{String(repo.name)}</strong><small>{String(repo.private) === 'true' ? 'Private' : 'Public'} · {String(repo.defaultBranch)}</small></div><span className="tag">Select</span></button>)}</div> : null}{selectedGitHubRepository ? <div className="form"><h3>Scan {String(selectedGitHubRepository.owner)}/{String(selectedGitHubRepository.name)}</h3><p className="subtle">CodexFlow will create a managed clone and scan its actual contents.</p><button className="button" type="button" onClick={() => void importSelectedGitHubRepository()} disabled={busy}>Clone & scan repository</button></div> : null}</section> : <section className="card"><h2>Connect GitHub</h2><p className="subtle">Authenticate with your GitHub account to browse repositories. Access tokens remain in an encrypted server-side session.</p><a className="button" href="/auth/github">Continue with GitHub</a></section>}
@@ -195,6 +210,6 @@ export function ControlPlane() {
     <section className="card" id="tasks"><h2>Tasks</h2>{tasks.length ? <div className="table">{tasks.map((task) => <button className="row task-row" onClick={() => void openTask(String(task.id))} key={String(task.id)}><div><strong>{String(task.prompt)}</strong><small>{String(task.createdAt)}</small></div><span className={statusClass(task.deliveryStatus ?? task.status)}>{String(task.deliveryStatus ?? task.status)}</span></button>)}</div> : <Empty>No tasks yet. Create one to start a persisted lifecycle.</Empty>}</section>
     <section className="card" id="evaluation"><h2>Evaluation benchmarks</h2>{evaluation ? <><p className="subtle">{evaluation.benchmarks.reduce((count, benchmark) => count + Number(benchmark.taskCount), 0)} controlled tasks · {evaluation.runs.length} persisted runs</p><div className="metrics"><div><strong>{String(evaluation.metrics.finalTaskSuccessRate ?? '—')}</strong><span>technical success</span></div><div><strong>{String(evaluation.metrics.repairRate ?? '—')}</strong><span>repair rate</span></div><div><strong>{String(evaluation.metrics.blockedRate ?? '—')}</strong><span>blocked rate</span></div></div><ul className="runs">{evaluation.benchmarks.map((benchmark) => <li key={String(benchmark.id)}><strong>{String(benchmark.name)}</strong><small>v{String(benchmark.version)} · {String(benchmark.taskCount)} tasks</small></li>)}</ul></> : <Empty>Loading persisted benchmark records.</Empty>}</section>
     <section className="card" id="operations"><h2>Operations</h2>{operations ? <div className="metrics"><div><strong>{operations.tasks.total}</strong><span>persisted tasks</span></div><div><strong>{operations.agents.failed}</strong><span>agent failures</span></div><div><strong>{operations.execution.activeLeases}</strong><span>active leases</span></div><div><strong>{operations.tasks.failed}</strong><span>blocked/failed tasks</span></div></div> : <Empty>Loading persisted operational state.</Empty>}</section>
-  <div id="delivery">{detail ? <Detail detail={detail} onUpdate={(task) => { setDetail(task); void refresh(); }} onError={setError} /> : <section className="card"><h2>Agent run</h2><Empty>Select a task to inspect its plan, agents, verification, risk, approval, delivery, and evaluation records.</Empty></section>}</div>
+  <div id="delivery">{detail ? <Detail detail={detail} onUpdate={(task) => { setDetail(task); void refresh(); }} onError={(message) => setError({ message })} /> : <section className="card"><h2>Agent run</h2><Empty>Select a task to inspect its plan, agents, verification, risk, approval, delivery, and evaluation records.</Empty></section>}</div>
   </main>;
 }

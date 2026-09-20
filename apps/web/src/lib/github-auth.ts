@@ -92,6 +92,21 @@ export function oauthConfigured() {
     process.env.CODEXFLOW_SESSION_SECRET,
   );
 }
+
+export function githubAppInstallUrl(environment: Record<string, string | undefined> = process.env) {
+  const configured = environment.GITHUB_APP_INSTALL_URL?.trim();
+  if (configured) {
+    const url = new URL(configured);
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com')
+      throw new Error('GITHUB_APP_INSTALL_URL must be an https://github.com URL');
+    return url.toString();
+  }
+  const slug = environment.GITHUB_APP_SLUG?.trim();
+  if (!slug) return undefined;
+  if (!/^[a-zA-Z0-9-]+$/.test(slug)) throw new Error('GITHUB_APP_SLUG is invalid');
+  return `https://github.com/apps/${slug}/installations/new`;
+}
+
 /**
  * Reverse proxies may expose an internal listener URL (for example
  * http://0.0.0.0:10000 on Render) to Next.js. OAuth redirect URIs must use

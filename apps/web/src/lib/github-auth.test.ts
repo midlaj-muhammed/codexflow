@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { githubOAuthOrigin } from './github-auth';
+import { githubAppInstallUrl, githubOAuthOrigin } from './github-auth';
 
 describe('githubOAuthOrigin', () => {
   it('uses the configured public origin instead of a reverse proxy listener', () => {
@@ -28,5 +28,27 @@ describe('githubOAuthOrigin', () => {
         NODE_ENV: 'production',
       }),
     ).toThrow('must use HTTPS');
+  });
+});
+
+describe('githubAppInstallUrl', () => {
+  it('builds the GitHub App install URL from a slug', () => {
+    expect(githubAppInstallUrl({ GITHUB_APP_SLUG: 'codexflow-dev' })).toBe(
+      'https://github.com/apps/codexflow-dev/installations/new',
+    );
+  });
+
+  it('accepts an explicit GitHub install URL', () => {
+    expect(
+      githubAppInstallUrl({
+        GITHUB_APP_INSTALL_URL: 'https://github.com/apps/codexflow-dev/installations/new',
+      }),
+    ).toBe('https://github.com/apps/codexflow-dev/installations/new');
+  });
+
+  it('rejects non-GitHub install URLs', () => {
+    expect(() =>
+      githubAppInstallUrl({ GITHUB_APP_INSTALL_URL: 'https://example.com/install' }),
+    ).toThrow('https://github.com URL');
   });
 });

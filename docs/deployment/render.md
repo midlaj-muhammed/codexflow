@@ -58,6 +58,9 @@ GITHUB_OAUTH_CLIENT_ID=<GitHub OAuth client ID>
 GITHUB_OAUTH_CLIENT_SECRET=<GitHub OAuth client secret>
 CODEXFLOW_SESSION_SECRET=<long random secret>
 CODEXFLOW_PUBLIC_URL=https://YOUR-RENDER-SERVICE.onrender.com
+GITHUB_APP_SLUG=<your-github-app-slug>
+# or:
+GITHUB_APP_INSTALL_URL=https://github.com/apps/<your-github-app-slug>/installations/new
 ```
 
 `DATABASE_URL` currently persists encrypted GitHub OAuth sessions. The main
@@ -77,6 +80,11 @@ organization that owns it and include that repository. Grant at least:
 After changing app permissions or repository selection, accept the updated
 installation permissions and reconnect GitHub in CodexFlow. Traditional OAuth
 `repo` scopes do not add permissions to a GitHub App user token.
+
+Set either `GITHUB_APP_SLUG` or `GITHUB_APP_INSTALL_URL` in Render. When a
+signed-in user has authorized the app but has not installed it on any accessible
+account or repository, CodexFlow will show an **Install GitHub App** action that
+opens GitHub's installation flow.
 
 Only add `CODEXFLOW_GITHUB_TOKEN` when the configured delivery flow requires
 a server-managed GitHub credential. OAuth tokens are encrypted server-side and
