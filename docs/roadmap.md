@@ -1,5 +1,9 @@
 # CodexFlow Roadmap
 
+> **Historical roadmap.** This records the original MVP sequence. The verified
+> final product state is documented in `FINAL-SYSTEM-AUDIT.md`; GitLab and
+> Bitbucket remain deferred and are not supported by the GitHub-only product.
+
 ## Hackathon MVP
 
 ### Phase 1 — Web Foundation

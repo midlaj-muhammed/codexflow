@@ -119,7 +119,7 @@ export function ControlPlane() {
       void refresh();
     }, 2_000);
     return () => window.clearInterval(timer);
-  }, [detail?.task.id, detail?.task.status, refresh]);
+  }, [detail, refresh]);
 
   async function importRepository(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(undefined);

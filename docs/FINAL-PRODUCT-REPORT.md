@@ -44,8 +44,9 @@ this report does not invent benchmark values.
 ## End-to-End Verification
 
 - Browser: PASS — `pnpm test:e2e`
-- OpenAI: PASS — `pnpm test:openai-e2e`
-- GitHub: PASS — `pnpm test:github-e2e`, PR #10 head equals delivery SHA
+- OpenAI: PASS — `pnpm test:openai-e2e` (3 real runtime/repair tests)
+- GitHub: PASS — `pnpm test:github-e2e`, Phase 20 PR #11 head equals delivery
+  and remote branch SHA
 
 ## Phase Results
 
@@ -53,6 +54,9 @@ this report does not invent benchmark values.
 - Phase 16: PASS — GitHub PR intelligence and remote SHA refresh.
 - Phase 17: PASS — readiness, operational state, and stale-lease handling.
 - Phase 18: PASS — integrated documentation, demo, and final verification.
+- Phase 19: PASS — final hardening and active-runtime cancellation correction.
+- Phase 20: PASS — release freeze, real OpenAI/GitHub revalidation, and final
+  product audit.
 
 ## Known Limitations
 
@@ -68,5 +72,5 @@ strategies, inspect evidence, approve, and verify the GitHub PR SHA.
 ## Final Test Matrix
 
 The evidence and exact commands are recorded in
-[phase-18.md](audits/phase-18.md). Skipped external tests are never counted as
+[phase-20.md](audits/phase-20.md). Skipped external tests are never counted as
 passing.

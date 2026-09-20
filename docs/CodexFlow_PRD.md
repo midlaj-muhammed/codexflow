@@ -1,5 +1,11 @@
 # CodexFlow --- Product Requirements Document (PRD)
 
+> **Historical implementation baseline.** This document records the original
+> hackathon planning scope and is not the current implementation authority.
+> CodexFlow's completed product scope is GitHub-only; proposed GitLab and
+> Bitbucket material below remains deferred. See `FINAL-SYSTEM-AUDIT.md` for
+> the verified current state.
+
 **Version:** 1.0\
 **Status:** Hackathon Implementation Baseline\
 **Product:** CodexFlow\

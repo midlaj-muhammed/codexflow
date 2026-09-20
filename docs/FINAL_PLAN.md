@@ -1,5 +1,10 @@
 # CodexFlow — Final Hackathon Implementation Plan
 
+> **Historical planning document.** This is retained for design provenance, not
+> as a statement of current supported providers or phase status. The completed
+> product is GitHub-only; GitLab and Bitbucket entries below are deferred. See
+> `FINAL-SYSTEM-AUDIT.md` and the Phase 19/20 audits for current evidence.
+
 ## 1. Product Definition
 
 **CodexFlow** is a web-based mission control system for AI coding agents.

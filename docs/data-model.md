@@ -1,5 +1,9 @@
 # CodexFlow Data Model
 
+> The persisted provider enum retains historical forward-compatible values, but
+> the implemented product and UI are GitHub-only. GitLab and Bitbucket are not
+> supported integrations; see `FINAL-SYSTEM-AUDIT.md` for product scope.
+
 ## Core entities
 
 ```text
