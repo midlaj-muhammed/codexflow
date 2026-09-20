@@ -25,7 +25,8 @@ export type RemotePullRequest = {
 export type RemoteCheck = {
   name: string;
   status: 'QUEUED' | 'IN_PROGRESS' | 'COMPLETED';
-  conclusion?: 'SUCCESS' | 'FAILURE' | 'NEUTRAL' | 'CANCELLED' | 'SKIPPED' | 'TIMED_OUT' | 'ACTION_REQUIRED';
+  conclusion?:
+    'SUCCESS' | 'FAILURE' | 'NEUTRAL' | 'CANCELLED' | 'SKIPPED' | 'TIMED_OUT' | 'ACTION_REQUIRED';
   url?: string;
 };
 export type RemotePullRequestComment = {
@@ -60,7 +61,11 @@ export interface GitProvider {
     number: number;
   }): Promise<RemotePullRequest>;
   getCommitChecks?(input: { owner: string; name: string; sha: string }): Promise<RemoteCheck[]>;
-  listPullRequestComments?(input: { owner: string; name: string; number: number }): Promise<RemotePullRequestComment[]>;
+  listPullRequestComments?(input: {
+    owner: string;
+    name: string;
+    number: number;
+  }): Promise<RemotePullRequestComment[]>;
   createPullRequestComment?(input: {
     owner: string;
     name: string;
@@ -98,7 +103,9 @@ const pullRequestSchema = z.object({
 const checkRunSchema = z.object({
   name: z.string(),
   status: z.enum(['queued', 'in_progress', 'completed']),
-  conclusion: z.enum(['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required']).nullable(),
+  conclusion: z
+    .enum(['success', 'failure', 'neutral', 'cancelled', 'skipped', 'timed_out', 'action_required'])
+    .nullable(),
   html_url: z.url().nullable(),
 });
 const commentSchema = z.object({
@@ -107,13 +114,23 @@ const commentSchema = z.object({
   user: z.object({ login: z.string() }),
   created_at: z.string(),
 });
+const installationsSchema = z.object({
+  installations: z.array(z.object({ id: z.number() })),
+});
+const installationRepositoriesSchema = z.object({
+  repositories: z.array(z.unknown()),
+});
 
 /**
  * Verifies GitHub's sha256 webhook signature without ever logging the secret
  * or body. Callers should reject unsigned events when a webhook secret is
  * configured.
  */
-export function verifyGitHubWebhookSignature(secret: string, rawBody: string, signature?: string): boolean {
+export function verifyGitHubWebhookSignature(
+  secret: string,
+  rawBody: string,
+  signature?: string,
+): boolean {
   if (!secret || !signature?.startsWith('sha256=')) return false;
   const expected = `sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`;
   const actualBytes = Buffer.from(signature);
@@ -190,6 +207,24 @@ export class GitHubProvider implements GitProvider {
     return { login: z.object({ login: z.string() }).parse(profile).login };
   }
   async listRepositories() {
+    if (this.token.startsWith('ghu_')) {
+      const installations = installationsSchema.parse(await this.request('/user/installations'));
+      if (!installations.installations.length)
+        throw new ProviderError(
+          'AUTH_FAILED',
+          'Install the GitHub App on an account or repository before importing a repository.',
+        );
+      const responses = await Promise.all(
+        installations.installations.map(({ id }) =>
+          this.request(`/user/installations/${id}/repositories?per_page=100`),
+        ),
+      );
+      const repositories = responses.flatMap(
+        (response) => installationRepositoriesSchema.parse(response).repositories,
+      );
+      const mapped = repositories.map((repository) => this.map(repository));
+      return [...new Map(mapped.map((repository) => [repository.id, repository])).values()];
+    }
     return z
       .array(z.unknown())
       .parse(await this.request('/user/repos?per_page=100&sort=updated'))
@@ -198,6 +233,11 @@ export class GitHubProvider implements GitProvider {
   async getRepository(owner: string, name: string) {
     return this.map(
       await this.request(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}`),
+    );
+  }
+  async assertRepositoryContentsAccess(owner: string, name: string) {
+    await this.request(
+      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/contents?per_page=1`,
     );
   }
   async listBranches(owner: string, name: string) {
@@ -211,12 +251,16 @@ export class GitHubProvider implements GitProvider {
       .map(({ name: branch }) => branch);
   }
   async createRepository(input: { name: string; private: boolean }) {
-    const value = z.object({ name: z.string().trim().min(1).max(100), private: z.boolean() }).parse(input);
-    return this.map(await this.request('/user/repos', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: value.name, private: value.private, auto_init: false }),
-    }));
+    const value = z
+      .object({ name: z.string().trim().min(1).max(100), private: z.boolean() })
+      .parse(input);
+    return this.map(
+      await this.request('/user/repos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: value.name, private: value.private, auto_init: false }),
+      }),
+    );
   }
   async createPullRequest(input: {
     owner: string;
@@ -276,7 +320,11 @@ export class GitHubProvider implements GitProvider {
   }
   async getPullRequest(input: { owner: string; name: string; number: number }) {
     const value = z
-      .object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive() })
+      .object({
+        owner: z.string().min(1),
+        name: z.string().min(1),
+        number: z.number().int().positive(),
+      })
       .parse(input);
     return this.mapPullRequest(
       await this.request(
@@ -284,13 +332,21 @@ export class GitHubProvider implements GitProvider {
       ),
     );
   }
-  async getCommitChecks(input: { owner: string; name: string; sha: string }): Promise<RemoteCheck[]> {
-    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), sha: z.string().min(1) }).parse(input);
-    const raw = z.object({ check_runs: z.array(checkRunSchema) }).parse(
-      await this.request(
-        `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/commits/${encodeURIComponent(value.sha)}/check-runs`,
-      ),
-    );
+  async getCommitChecks(input: {
+    owner: string;
+    name: string;
+    sha: string;
+  }): Promise<RemoteCheck[]> {
+    const value = z
+      .object({ owner: z.string().min(1), name: z.string().min(1), sha: z.string().min(1) })
+      .parse(input);
+    const raw = z
+      .object({ check_runs: z.array(checkRunSchema) })
+      .parse(
+        await this.request(
+          `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/commits/${encodeURIComponent(value.sha)}/check-runs`,
+        ),
+      );
     return raw.check_runs.map((check) => ({
       name: check.name,
       status: check.status.toUpperCase() as RemoteCheck['status'],
@@ -298,22 +354,61 @@ export class GitHubProvider implements GitProvider {
       url: check.html_url ?? undefined,
     }));
   }
-  async listPullRequestComments(input: { owner: string; name: string; number: number }): Promise<RemotePullRequestComment[]> {
-    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive() }).parse(input);
-    const raw = z.array(commentSchema).parse(
-      await this.request(`/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments?per_page=100`),
-    );
-    return raw.map((comment) => ({ id: String(comment.id), body: comment.body, author: comment.user.login, createdAt: comment.created_at }));
+  async listPullRequestComments(input: {
+    owner: string;
+    name: string;
+    number: number;
+  }): Promise<RemotePullRequestComment[]> {
+    const value = z
+      .object({
+        owner: z.string().min(1),
+        name: z.string().min(1),
+        number: z.number().int().positive(),
+      })
+      .parse(input);
+    const raw = z
+      .array(commentSchema)
+      .parse(
+        await this.request(
+          `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments?per_page=100`,
+        ),
+      );
+    return raw.map((comment) => ({
+      id: String(comment.id),
+      body: comment.body,
+      author: comment.user.login,
+      createdAt: comment.created_at,
+    }));
   }
-  async createPullRequestComment(input: { owner: string; name: string; number: number; body: string }): Promise<RemotePullRequestComment> {
-    const value = z.object({ owner: z.string().min(1), name: z.string().min(1), number: z.number().int().positive(), body: z.string().trim().min(1).max(10_000) }).parse(input);
+  async createPullRequestComment(input: {
+    owner: string;
+    name: string;
+    number: number;
+    body: string;
+  }): Promise<RemotePullRequestComment> {
+    const value = z
+      .object({
+        owner: z.string().min(1),
+        name: z.string().min(1),
+        number: z.number().int().positive(),
+        body: z.string().trim().min(1).max(10_000),
+      })
+      .parse(input);
     const raw = commentSchema.parse(
-      await this.request(`/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ body: value.body }),
-      }),
+      await this.request(
+        `/repos/${encodeURIComponent(value.owner)}/${encodeURIComponent(value.name)}/issues/${value.number}/comments`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ body: value.body }),
+        },
+      ),
     );
-    return { id: String(raw.id), body: raw.body, author: raw.user.login, createdAt: raw.created_at };
+    return {
+      id: String(raw.id),
+      body: raw.body,
+      author: raw.user.login,
+      createdAt: raw.created_at,
+    };
   }
 }

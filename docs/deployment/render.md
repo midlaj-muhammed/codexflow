@@ -63,6 +63,21 @@ CODEXFLOW_PUBLIC_URL=https://YOUR-RENDER-SERVICE.onrender.com
 `DATABASE_URL` currently persists encrypted GitHub OAuth sessions. The main
 CodexFlow control-plane store remains SQLite and is persisted on `/data`.
 
+## GitHub App permissions and installation
+
+This deployment uses a GitHub App client ID. GitHub App user tokens are limited
+to both the user's access and the repositories where the app is installed.
+Before importing a private repository, install the app on the account or
+organization that owns it and include that repository. Grant at least:
+
+- **Repository contents:** Read and write — required for managed clone and
+  later authenticated push.
+- **Pull requests:** Read and write — required for durable PR delivery.
+
+After changing app permissions or repository selection, accept the updated
+installation permissions and reconnect GitHub in CodexFlow. Traditional OAuth
+`repo` scopes do not add permissions to a GitHub App user token.
+
 Only add `CODEXFLOW_GITHUB_TOKEN` when the configured delivery flow requires
 a server-managed GitHub credential. OAuth tokens are encrypted server-side and
 must never be placed in browser storage.

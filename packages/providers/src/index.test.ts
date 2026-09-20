@@ -25,13 +25,65 @@ describe('GitHubProvider', () => {
       expect.objectContaining({ provider: 'github', name: 'demo' }),
     ]);
   });
+  it('lists only repositories available through a GitHub App installation', async () => {
+    const paths: string[] = [];
+    const repository = {
+      id: 1,
+      owner: { login: 'acme' },
+      name: 'installed',
+      html_url: 'https://github.com/acme/installed',
+      clone_url: 'https://github.com/acme/installed.git',
+      default_branch: 'main',
+      private: true,
+    };
+    const provider = new GitHubProvider('ghu_fixture', async (input) => {
+      const path = String(input);
+      paths.push(path);
+      if (path.endsWith('/user/installations'))
+        return new Response(JSON.stringify({ installations: [{ id: 42 }] }));
+      return new Response(JSON.stringify({ repositories: [repository] }));
+    });
+    await expect(provider.listRepositories()).resolves.toEqual([
+      expect.objectContaining({ name: 'installed' }),
+    ]);
+    expect(paths).toEqual([
+      'https://api.github.com/user/installations',
+      'https://api.github.com/user/installations/42/repositories?per_page=100',
+    ]);
+  });
+
+  it('checks repository contents access before a managed clone', async () => {
+    const provider = new GitHubProvider('token', json([]) as typeof fetch);
+    await expect(provider.assertRepositoryContentsAccess('acme', 'demo')).resolves.toBeUndefined();
+    await expect(
+      new GitHubProvider('token', json({}, 403) as typeof fetch).assertRepositoryContentsAccess(
+        'acme',
+        'demo',
+      ),
+    ).rejects.toMatchObject({ code: 'AUTH_FAILED' } satisfies Partial<ProviderError>);
+  });
   it('creates a repository through the authenticated server-side provider', async () => {
-    const provider = new GitHubProvider('secret-token', json({
-      id: 1, owner: { login: 'acme' }, name: 'new-project', html_url: 'https://github.com/acme/new-project',
-      clone_url: 'https://github.com/acme/new-project.git', default_branch: 'main', private: true,
-    }, 201) as typeof fetch);
-    await expect(provider.createRepository({ name: 'new-project', private: true })).resolves.toMatchObject({
-      owner: 'acme', name: 'new-project', private: true,
+    const provider = new GitHubProvider(
+      'secret-token',
+      json(
+        {
+          id: 1,
+          owner: { login: 'acme' },
+          name: 'new-project',
+          html_url: 'https://github.com/acme/new-project',
+          clone_url: 'https://github.com/acme/new-project.git',
+          default_branch: 'main',
+          private: true,
+        },
+        201,
+      ) as typeof fetch,
+    );
+    await expect(
+      provider.createRepository({ name: 'new-project', private: true }),
+    ).resolves.toMatchObject({
+      owner: 'acme',
+      name: 'new-project',
+      private: true,
     });
   });
   it('maps authentication and availability failures to structured errors', async () => {
@@ -69,7 +121,8 @@ describe('GitHubProvider', () => {
     const provider = new GitHubProvider('token', async (input, init) => {
       paths.push(String(input));
       if (init?.method === 'POST') return new Response(JSON.stringify(pull), { status: 201 });
-      if (String(input).endsWith('/pulls/3')) return new Response(JSON.stringify({ ...pull, state: 'closed' }));
+      if (String(input).endsWith('/pulls/3'))
+        return new Response(JSON.stringify({ ...pull, state: 'closed' }));
       return new Response(JSON.stringify([pull]));
     });
     await expect(
@@ -83,9 +136,16 @@ describe('GitHubProvider', () => {
       }),
     ).resolves.toMatchObject({ number: 3, status: 'OPEN', headSha: 'abc123' });
     await expect(
-      provider.findPullRequest({ owner: 'acme', name: 'demo', head: 'codexflow/task-1', base: 'main' }),
+      provider.findPullRequest({
+        owner: 'acme',
+        name: 'demo',
+        head: 'codexflow/task-1',
+        base: 'main',
+      }),
     ).resolves.toMatchObject({ number: 3, headSha: 'abc123' });
-    await expect(provider.getPullRequest({ owner: 'acme', name: 'demo', number: 3 })).resolves.toMatchObject({
+    await expect(
+      provider.getPullRequest({ owner: 'acme', name: 'demo', number: 3 }),
+    ).resolves.toMatchObject({
       number: 3,
       status: 'CLOSED',
       headSha: 'abc123',
@@ -101,20 +161,64 @@ describe('GitHubProvider', () => {
     const provider = new GitHubProvider('token', async (input, init) => {
       const path = String(input);
       if (path.includes('/check-runs')) {
-        return new Response(JSON.stringify({ check_runs: [{ name: 'test', status: 'completed', conclusion: 'success', html_url: 'https://github.com/acme/demo/runs/1' }] }));
+        return new Response(
+          JSON.stringify({
+            check_runs: [
+              {
+                name: 'test',
+                status: 'completed',
+                conclusion: 'success',
+                html_url: 'https://github.com/acme/demo/runs/1',
+              },
+            ],
+          }),
+        );
       }
       if (init?.method === 'POST') {
-        return new Response(JSON.stringify({ id: 9, body: 'Please review.', user: { login: 'codexflow' }, created_at: '2026-01-01T00:00:00Z' }), { status: 201 });
+        return new Response(
+          JSON.stringify({
+            id: 9,
+            body: 'Please review.',
+            user: { login: 'codexflow' },
+            created_at: '2026-01-01T00:00:00Z',
+          }),
+          { status: 201 },
+        );
       }
-      return new Response(JSON.stringify([{ id: 8, body: 'Looks good.', user: { login: 'human' }, created_at: '2026-01-01T00:00:00Z' }]));
+      return new Response(
+        JSON.stringify([
+          {
+            id: 8,
+            body: 'Looks good.',
+            user: { login: 'human' },
+            created_at: '2026-01-01T00:00:00Z',
+          },
+        ]),
+      );
     });
-    await expect(provider.getCommitChecks({ owner: 'acme', name: 'demo', sha: 'abc123' })).resolves.toEqual([
-      { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', url: 'https://github.com/acme/demo/runs/1' },
+    await expect(
+      provider.getCommitChecks({ owner: 'acme', name: 'demo', sha: 'abc123' }),
+    ).resolves.toEqual([
+      {
+        name: 'test',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+        url: 'https://github.com/acme/demo/runs/1',
+      },
     ]);
-    await expect(provider.listPullRequestComments({ owner: 'acme', name: 'demo', number: 3 })).resolves.toEqual([
+    await expect(
+      provider.listPullRequestComments({ owner: 'acme', name: 'demo', number: 3 }),
+    ).resolves.toEqual([
       { id: '8', body: 'Looks good.', author: 'human', createdAt: '2026-01-01T00:00:00Z' },
     ]);
-    await expect(provider.createPullRequestComment({ owner: 'acme', name: 'demo', number: 3, body: 'Please review.' })).resolves.toMatchObject({ id: '9', author: 'codexflow' });
+    await expect(
+      provider.createPullRequestComment({
+        owner: 'acme',
+        name: 'demo',
+        number: 3,
+        body: 'Please review.',
+      }),
+    ).resolves.toMatchObject({ id: '9', author: 'codexflow' });
   });
   it('validates GitHub webhook signatures without exposing the secret', () => {
     const secret = 'webhook-secret';

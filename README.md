@@ -266,6 +266,14 @@ The OAuth client secret and access token are never placed in browser storage or
 URLs. The state and session cookies are HTTP-only, `SameSite=Lax`, and marked
 secure in production. Access tokens are AES-GCM encrypted before persistence.
 
+When configured with a GitHub App client ID, CodexFlow lists repositories from
+the user's app installations rather than presenting repositories the app cannot
+clone. The app must be installed on the selected repository and have
+**Repository contents: Read and write** for managed clone/push, plus **Pull
+requests: Read and write** for PR delivery. GitHub App user tokens use the
+intersection of user and app permissions; traditional OAuth `repo` scopes do
+not expand them.
+
 After sign-in, `/api/github/repositories` obtains repository identity from the
 authenticated session; `/api/github/import` creates a managed clone using the
 GitHub provider and Git engine. A user does not need to type a server filesystem

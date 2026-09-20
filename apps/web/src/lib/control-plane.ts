@@ -3,7 +3,7 @@ import { CodexFlowStore, openDatabase } from '@codexflow/database';
 import { DeliveryService, type DeliveryRecord } from '@codexflow/delivery';
 import { calculateEvaluationMetrics, ensureStarterBenchmark } from '@codexflow/evaluation';
 import { GitEngine } from '@codexflow/git';
-import { GitHubProvider } from '@codexflow/providers';
+import { GitHubProvider, ProviderError } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 import { basename } from 'node:path';
 import { join, relative } from 'node:path';
@@ -69,10 +69,25 @@ export async function githubRepositories(token = githubToken()) {
   if (!token) throw new Error('GitHub is not connected on this server');
   return new GitHubProvider(token).listRepositories();
 }
-export async function importGitHubRepository(input: { owner: string; name: string; token: string }) {
+export async function importGitHubRepository(input: {
+  owner: string;
+  name: string;
+  token: string;
+}) {
   const { store, git } = controlPlane();
-  const remote = await new GitHubProvider(input.token).getRepository(input.owner, input.name);
-  const projectsRoot = process.env.CODEXFLOW_PROJECT_ROOT ?? join(tmpdir(), 'codexflow', 'projects');
+  const provider = new GitHubProvider(input.token);
+  const remote = await provider.getRepository(input.owner, input.name);
+  try {
+    await provider.assertRepositoryContentsAccess(input.owner, input.name);
+  } catch (error) {
+    if (error instanceof ProviderError && ['AUTH_FAILED', 'NOT_FOUND'].includes(error.code))
+      throw new Error(
+        'GitHub App access is missing for this repository. Install the app on this repository and grant Repository contents: Read and write, then reconnect GitHub.',
+      );
+    throw error;
+  }
+  const projectsRoot =
+    process.env.CODEXFLOW_PROJECT_ROOT ?? join(tmpdir(), 'codexflow', 'projects');
   const root = join(projectsRoot, `github-${remote.id}`);
   if (!(await git.isRepository(root))) {
     // This directory is created exclusively from the authoritative GitHub
@@ -87,8 +102,19 @@ export async function importGitHubRepository(input: { owner: string; name: strin
   }
   const state = await git.inspect(root);
   const metadata = await scanProject(root);
-  const repository = store.createRepository({ provider: 'github', owner: remote.owner, name: remote.name, url: remote.url, defaultBranch: remote.defaultBranch, localPath: root });
-  const project = store.createProject(String(repository.id), remote.name, metadata as Record<string, unknown>);
+  const repository = store.createRepository({
+    provider: 'github',
+    owner: remote.owner,
+    name: remote.name,
+    url: remote.url,
+    defaultBranch: remote.defaultBranch,
+    localPath: root,
+  });
+  const project = store.createProject(
+    String(repository.id),
+    remote.name,
+    metadata as Record<string, unknown>,
+  );
   return { repository, project, git: state, scan: metadata };
 }
 
@@ -122,15 +148,17 @@ export async function deliverApprovedTask(taskId: string) {
     .map((file) => file.trim())
     .filter(Boolean);
   const metadata = (snapshot.project.metadata ?? {}) as Record<string, unknown>;
-  const command = typeof metadata.testCommand === 'string' ? metadata.testCommand : 'git diff --check';
+  const command =
+    typeof metadata.testCommand === 'string' ? metadata.testCommand : 'git diff --check';
   const approval = store.loadApproval(taskId);
   if (!approval) throw new Error('Approval record is unavailable');
   const verification = {
     commands: [command],
     requiresNewTests: false,
-    rationale: typeof metadata.testCommand === 'string'
-      ? 'Project scan final verification'
-      : 'No project test command was detected; verify the actual Git diff is syntactically clean.',
+    rationale:
+      typeof metadata.testCommand === 'string'
+        ? 'Project scan final verification'
+        : 'No project test command was detected; verify the actual Git diff is syntactically clean.',
   };
   const delivery = new DeliveryService(
     git,
@@ -156,7 +184,10 @@ export async function deliverApprovedTask(taskId: string) {
     repository: String(snapshot.repository.name),
     baseBranch: String(snapshot.repository.defaultBranch),
     taskPrompt: String(snapshot.task.prompt),
-    agentRuns: snapshot.agents.map((agent) => ({ role: String(agent.role), status: String(agent.status) })),
+    agentRuns: snapshot.agents.map((agent) => ({
+      role: String(agent.role),
+      status: String(agent.status),
+    })),
     reviewFindings: snapshot.reviews[0]?.findings,
   });
 }
@@ -165,7 +196,12 @@ export async function deliverApprovedTask(taskId: string) {
 export async function refreshTaskPullRequest(taskId: string) {
   const { store, git, events } = controlPlane();
   const snapshot = taskSnapshot(taskId);
-  if (!snapshot?.workspace || !snapshot.repository || !snapshot.delivery.commit || !snapshot.approval)
+  if (
+    !snapshot?.workspace ||
+    !snapshot.repository ||
+    !snapshot.delivery.commit ||
+    !snapshot.approval
+  )
     throw new Error('Pull request delivery context is unavailable');
   const pullRequest = snapshot.delivery.pullRequests.find((entry) => entry.status === 'SUCCEEDED');
   if (!pullRequest?.number) throw new Error('No delivered pull request is available');
@@ -180,28 +216,50 @@ export async function refreshTaskPullRequest(taskId: string) {
     baselineCommit: String(snapshot.workspace.baselineCommit),
     diff: '',
     changedFiles: [],
-    verification: { commands: [typeof metadata.testCommand === 'string' ? metadata.testCommand : 'git diff --check'], requiresNewTests: false, rationale: 'Persisted delivery refresh' },
+    verification: {
+      commands: [
+        typeof metadata.testCommand === 'string' ? metadata.testCommand : 'git diff --check',
+      ],
+      requiresNewTests: false,
+      rationale: 'Persisted delivery refresh',
+    },
     risk: snapshot.approval.risk,
     owner: String(snapshot.repository.owner),
     repository: String(snapshot.repository.name),
     baseBranch: String(snapshot.repository.defaultBranch),
-    commit: { sha: String(snapshot.delivery.commit.sha), message: String(snapshot.delivery.commit.message) },
+    commit: {
+      sha: String(snapshot.delivery.commit.sha),
+      message: String(snapshot.delivery.commit.message),
+    },
     pullRequest: {
-      id: String(pullRequest.number), number: Number(pullRequest.number), url: String(pullRequest.url),
-      title: String(pullRequest.title), body: String(pullRequest.body),
+      id: String(pullRequest.number),
+      number: Number(pullRequest.number),
+      url: String(pullRequest.url),
+      title: String(pullRequest.title),
+      body: String(pullRequest.body),
       status: String(pullRequest.remoteStatus ?? 'OPEN') as 'OPEN' | 'CLOSED' | 'MERGED',
       headSha: pullRequest.headSha ? String(pullRequest.headSha) : undefined,
     },
   };
-  const delivery = new DeliveryService(git, new ApprovalService(store), new TesterAgent(), new GitHubProvider(token), undefined, undefined, store,
-    { lifecycle: { recordDeliveryState: async (_taskId, status) => status }, events });
+  const delivery = new DeliveryService(
+    git,
+    new ApprovalService(store),
+    new TesterAgent(),
+    new GitHubProvider(token),
+    undefined,
+    undefined,
+    store,
+    { lifecycle: { recordDeliveryState: async (_taskId, status) => status }, events },
+  );
   return delivery.refreshPullRequest(record);
 }
 
 function githubRemote(remote: string | undefined) {
   if (!remote) return undefined;
   const match = remote.match(/github\.com[/:]([^/]+)\/([^/]+?)(?:\.git)?$/i);
-  return match ? { owner: match[1], name: match[2], url: `https://github.com/${match[1]}/${match[2]}` } : undefined;
+  return match
+    ? { owner: match[1], name: match[2], url: `https://github.com/${match[1]}/${match[2]}` }
+    : undefined;
 }
 
 export async function importLocalRepository(input: {
@@ -213,19 +271,33 @@ export async function importLocalRepository(input: {
 }) {
   const { store, git } = controlPlane();
   if (!(await git.isRepository(input.localPath)))
-    throw new Error('Selected local folder is not a Git repository. Initialize Git before importing it.');
+    throw new Error(
+      'Selected local folder is not a Git repository. Initialize Git before importing it.',
+    );
   const state = await git.inspect(input.localPath);
   let remote: string | undefined;
-  try { remote = (await git.remoteUrl(input.localPath)).stdout; } catch { /* local-only repository */ }
+  try {
+    remote = (await git.remoteUrl(input.localPath)).stdout;
+  } catch {
+    /* local-only repository */
+  }
   const github = githubRemote(remote);
   const metadata = await scanProject(input.localPath);
   const name = input.name?.trim() || github?.name || basename(input.localPath);
   const owner = input.owner?.trim() || github?.owner || 'local';
   const repository = store.createRepository({
-    provider: 'github', owner, name, url: input.url?.trim() || github?.url || `https://github.local/${owner}/${name}`,
-    defaultBranch: input.defaultBranch?.trim() || state.branch || 'main', localPath: input.localPath,
+    provider: 'github',
+    owner,
+    name,
+    url: input.url?.trim() || github?.url || `https://github.local/${owner}/${name}`,
+    defaultBranch: input.defaultBranch?.trim() || state.branch || 'main',
+    localPath: input.localPath,
   });
-  const project = store.createProject(String(repository.id), name, metadata as Record<string, unknown>);
+  const project = store.createProject(
+    String(repository.id),
+    name,
+    metadata as Record<string, unknown>,
+  );
   return { repository, project, git: state, scan: metadata };
 }
 
@@ -241,13 +313,22 @@ export async function inspectProjectHealth(projectId: string) {
   );
   const gitState = await git.inspect(String(repository.localPath));
   const results = commands.length
-    ? await new TesterAgent().verify(String(repository.localPath), { commands, requiresNewTests: false, rationale: 'Explicit project health inspection' })
+    ? await new TesterAgent().verify(String(repository.localPath), {
+        commands,
+        requiresNewTests: false,
+        rationale: 'Explicit project health inspection',
+      })
     : [];
   return { project, repository, metadata, git: gitState, results };
 }
 
 const sensitivePath = /(^|\/)(\.env(?:\..*)?|credentials\.json|secrets\.|.*\.(pem|key))$/i;
-export async function publishProjectToGitHub(input: { projectId: string; name: string; private: boolean; token?: string }) {
+export async function publishProjectToGitHub(input: {
+  projectId: string;
+  name: string;
+  private: boolean;
+  token?: string;
+}) {
   const { store, git } = controlPlane();
   const token = input.token;
   if (!token) throw new Error('GitHub is not connected on this server');
@@ -273,9 +354,16 @@ export async function publishProjectToGitHub(input: { projectId: string; name: s
   await git.addRemote(path, 'origin', created.cloneUrl);
   await git.pushSetUpstreamAuthenticated(path, 'origin', state.branch!, token);
   const updated = store.updateRepository(String(repository.id), {
-    owner: created.owner, name: created.name, url: created.url, defaultBranch: created.defaultBranch,
+    owner: created.owner,
+    name: created.name,
+    url: created.url,
+    defaultBranch: created.defaultBranch,
   });
-  return { repository: updated, remote: { owner: created.owner, name: created.name, url: created.url }, branch: state.branch };
+  return {
+    repository: updated,
+    remote: { owner: created.owner, name: created.name, url: created.url },
+    branch: state.branch,
+  };
 }
 
 export async function repositorySnapshot(repository: Record<string, unknown>) {
@@ -331,10 +419,15 @@ export function evaluationSnapshot() {
   const { store } = controlPlane();
   const starter = ensureStarterBenchmark(store);
   const runs = store.listEvaluationRuns();
-  return { benchmarks: store.listBenchmarks().map((benchmark) => ({
-    ...benchmark,
-    taskCount: store.listBenchmarkTasks(benchmark.id).length,
-  })), starter, runs, metrics: calculateEvaluationMetrics(runs) };
+  return {
+    benchmarks: store.listBenchmarks().map((benchmark) => ({
+      ...benchmark,
+      taskCount: store.listBenchmarkTasks(benchmark.id).length,
+    })),
+    starter,
+    runs,
+    metrics: calculateEvaluationMetrics(runs),
+  };
 }
 
 /** Derived solely from persisted runtime state; no synthetic operational metrics. */
@@ -350,8 +443,19 @@ export function operationsSnapshot() {
   }, {});
   return {
     generatedAt: new Date().toISOString(),
-    tasks: { total: tasks.length, byState: taskStates, failed: tasks.filter((task) => ['FAILED', 'BLOCKED', 'CANCELLED'].includes(String(task.status))).length },
-    agents: { total: agentRuns.length, failed: agentRuns.filter((run) => ['FAILED', 'TIMED_OUT', 'CANCELLED'].includes(String(run.status))).length },
+    tasks: {
+      total: tasks.length,
+      byState: taskStates,
+      failed: tasks.filter((task) =>
+        ['FAILED', 'BLOCKED', 'CANCELLED'].includes(String(task.status)),
+      ).length,
+    },
+    agents: {
+      total: agentRuns.length,
+      failed: agentRuns.filter((run) =>
+        ['FAILED', 'TIMED_OUT', 'CANCELLED'].includes(String(run.status)),
+      ).length,
+    },
     execution: { activeLeases: store.listTaskExecutionLocks().length, reclaimedStaleLeases },
   };
 }
