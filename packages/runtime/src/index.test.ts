@@ -328,6 +328,9 @@ describe('runtime', () => {
     await expect(executorFor(unconfigured).execute(String(unconfigured.task.id))).resolves.toMatchObject(
       { status: 'FAILED', finalState: 'FAILED', error: { code: 'PROVIDER_NOT_CONFIGURED' } },
     );
+    expect(unconfigured.store.listAgentRuns(String(unconfigured.task.id))).toEqual([
+      expect.objectContaining({ role: 'SUPERVISOR', status: 'FAILED', error: 'Structured coder provider is not configured' }),
+    ]);
 
     const duplicate = await runtimeFixture();
     let release!: () => void;

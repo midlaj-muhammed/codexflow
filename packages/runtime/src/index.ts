@@ -673,6 +673,25 @@ export class RuntimeExecutor {
           : controller.signal.aborted
             ? this.abortFailure(error)
             : this.classifyFailure(error, Boolean(workspace));
+      // Failures before a workspace or the first pipeline stage used to be
+      // visible only in an in-memory EventBus. Persist a safe supervisor run
+      // so a task detail remains diagnosable after the HTTP request finishes.
+      if (currentState === 'PLANNING' && !workspace && stageRuns.size === 0 && this.store.getTask(taskId)) {
+        const failedRun = this.store.createAgentRun({
+          taskId,
+          role: 'SUPERVISOR',
+          attempt: 1,
+        });
+        this.store.updateAgentRun(failedRun.id, {
+          status: this.agentFailureStatus(failure.message),
+          error: failure.message,
+        });
+        this.store.appendAgentEvent({
+          agentRunId: failedRun.id,
+          type: 'agent.failed',
+          payload: { role: 'SUPERVISOR', code: failure.code, error: failure.message },
+        });
+      }
       if (currentState && currentState !== 'FAILED' && currentState !== 'BLOCKED' && currentState !== 'CANCELLED') {
         currentState = failure.code === 'CANCELLED'
           ? await this.cancelLifecycle(taskId, currentState)

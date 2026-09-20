@@ -22,6 +22,21 @@ type GlobalControlPlane = typeof globalThis & {
 
 const globalControlPlane = globalThis as GlobalControlPlane;
 
+/**
+ * The runtime creates Git worktrees and executes commands after the HTTP
+ * response. Standard Vercel functions provide neither a durable filesystem
+ * nor a persistent process, so accepting an execution there only produces a
+ * misleading later FAILED task.
+ */
+export function taskExecutionEnvironmentBlocker(
+  environment: Record<string, string | undefined> = process.env,
+) {
+  if (environment.VERCEL === '1') {
+    return 'Task execution requires a persistent Node runtime with Git and durable project/workspace storage. Standard Vercel functions can host the UI but cannot safely run CodexFlow tasks.';
+  }
+  return undefined;
+}
+
 /** Server-only gateway to the existing SQLite store and Git engine. */
 export function controlPlane() {
   if (!globalControlPlane.__codexflowControlPlane) {
@@ -79,6 +94,8 @@ export async function importGitHubRepository(input: { owner: string; name: strin
 
 /** Starts the existing RuntimeExecutor and deliberately does not orchestrate agents in HTTP code. */
 export function startTaskExecution(taskId: string) {
+  const environmentBlocker = taskExecutionEnvironmentBlocker();
+  if (environmentBlocker) throw new Error(environmentBlocker);
   const plane = controlPlane();
   const existing = plane.executions.get(taskId);
   if (existing) return { started: false, execution: existing };
