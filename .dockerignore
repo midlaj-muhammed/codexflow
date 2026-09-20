@@ -1,0 +1,17 @@
+.git
+.gstack
+.turbo
+.next
+node_modules
+**/node_modules
+**/.next
+.env
+.env.*
+!.env.example
+.codexflow
+apps/web/.codexflow
+demo
+coverage
+playwright-report
+test-results
+*.tsbuildinfo

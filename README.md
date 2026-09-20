@@ -2,7 +2,7 @@
 
 **AI coding agents. Under control.** CodexFlow is a developer control plane for AI coding work: it coordinates planning, coding, review, verification, bounded repair, human approval, and GitHub delivery without giving agents direct access to the primary checkout.
 
-> Status: release-candidate source for a persistent Node.js host. The full runtime is **not compatible with standard Vercel serverless**; see [the deployment assessment](docs/deployment/vercel.md).
+> Status: release-candidate source for a persistent Node.js host. The full runtime is **not compatible with standard Vercel serverless**; see [the deployment assessment](docs/deployment/vercel.md). A Docker-based [Render deployment guide](docs/deployment/render.md) is available for the complete Git/worktree runtime.
 
 ## How it works
 
