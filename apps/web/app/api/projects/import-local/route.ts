@@ -2,8 +2,9 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { NextResponse } from 'next/server';
+import { GitEngine } from '@codexflow/git';
 import { apiError } from '@/lib/api';
-import { controlPlane, importLocalRepository } from '@/lib/control-plane';
+import { importLocalRepository } from '@/lib/control-plane';
 
 const ignored = /(^|\/)(node_modules|\.git|dist|build|coverage)(\/|$)|(^|\/)\.env(?:\..*)?$|(^|\/)(credentials\.json|secrets\.|.*\.(pem|key))$/i;
 const safe = (path: string) => path && !path.startsWith('/') && !path.split('/').some((part) => part === '..' || !part);
@@ -28,7 +29,11 @@ export async function POST(request: Request) {
       await writeFile(target, Buffer.from(await files[index].arrayBuffer())); imported += 1;
     }
     if (!imported) throw new Error('All selected files were excluded by the project safety policy');
-    await controlPlane().git.initializeSnapshot(root);
+    // Do not use the process-wide control-plane singleton to initialize an
+    // imported source. In development, that singleton can survive a module
+    // hot reload with an older GitEngine prototype. A fresh engine also keeps
+    // import setup separate from the task runtime's authoritative engine.
+    await new GitEngine().initializeSnapshot(root);
     const importedProject = await importLocalRepository({ localPath: root, name });
     return NextResponse.json({ ...importedProject, import: { filesImported: imported, ignored: ignoredPaths.slice(0, 100) } }, { status: 201 });
   } catch (error) { return apiError(error); }
