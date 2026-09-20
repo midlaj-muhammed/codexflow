@@ -1,5 +1,6 @@
 import { mkdir, rm } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { GitEngine, GitError } from '@codexflow/git';
 export type Workspace = {
   id: string;
@@ -13,7 +14,7 @@ export class WorkspaceManager {
   private readonly workspaces = new Map<string, Workspace>();
   constructor(
     private readonly git = new GitEngine(),
-    private readonly root = join(process.cwd(), '.codexflow', 'workspaces'),
+    private readonly root = process.env.CODEXFLOW_WORKSPACE_ROOT ?? join(tmpdir(), 'codexflow', 'workspaces'),
   ) {}
   async createWorkspace(input: { repositoryPath: string; taskId: string; baseBranch: string }) {
     const state = await this.git.inspect(input.repositoryPath);

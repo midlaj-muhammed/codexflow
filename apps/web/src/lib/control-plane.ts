@@ -7,6 +7,7 @@ import { GitHubProvider } from '@codexflow/providers';
 import { EventBus, RuntimeExecutor, type RuntimeExecutionResult } from '@codexflow/runtime';
 import { basename } from 'node:path';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 type GlobalControlPlane = typeof globalThis & {
   __codexflowControlPlane?: {
@@ -55,7 +56,8 @@ export async function githubRepositories(token = githubToken()) {
 export async function importGitHubRepository(input: { owner: string; name: string; token: string }) {
   const { store, git } = controlPlane();
   const remote = await new GitHubProvider(input.token).getRepository(input.owner, input.name);
-  const root = join(process.cwd(), '.codexflow', 'projects', `github-${remote.id}`);
+  const projectsRoot = process.env.CODEXFLOW_PROJECT_ROOT ?? join(tmpdir(), 'codexflow', 'projects');
+  const root = join(projectsRoot, `github-${remote.id}`);
   if (!(await git.isRepository(root))) await git.cloneGitHubRepository(remote.cloneUrl, root, remote.defaultBranch, input.token);
   const state = await git.inspect(root);
   const metadata = await scanProject(root);

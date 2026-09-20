@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { tmpdir } from 'node:os';
 import { NextResponse } from 'next/server';
 import { GitEngine } from '@codexflow/git';
 import { apiError } from '@/lib/api';
@@ -17,7 +18,8 @@ export async function POST(request: Request) {
     const name = String(form.get('name') ?? 'local-project').replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 100) || 'local-project';
     if (!files.length || files.length !== paths.length) throw new Error('Select a folder containing at least one transferable file');
     if (files.length > 2_000) throw new Error('Folder import exceeds the 2,000-file safety limit');
-    const root = resolve(process.cwd(), '.codexflow', 'projects', `${name}-${randomUUID()}`);
+    const projectsRoot = process.env.CODEXFLOW_PROJECT_ROOT ?? resolve(tmpdir(), 'codexflow', 'projects');
+    const root = resolve(projectsRoot, `${name}-${randomUUID()}`);
     let imported = 0; const ignoredPaths: string[] = [];
     for (let index = 0; index < files.length; index += 1) {
       const path = paths[index].replaceAll('\\', '/');
