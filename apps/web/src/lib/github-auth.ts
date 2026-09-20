@@ -1,11 +1,50 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'node:crypto';
 import { cookies } from 'next/headers';
+import postgres, { type Sql } from 'postgres';
 import { GitHubProvider } from '@codexflow/providers';
 import { controlPlane } from './control-plane';
 
 const sessionCookie = 'codexflow_github_session';
 const stateCookie = 'codexflow_github_oauth_state';
 const maxAge = 60 * 60 * 24 * 7;
+
+type SessionRow = { id: string; login: string; tokenCiphertext: string; expiresAt: string };
+type GlobalSessions = typeof globalThis & { __codexflowSessionSql?: Sql };
+const sessionGlobal = globalThis as GlobalSessions;
+
+function sessionSql() {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl?.startsWith('postgres')) return undefined;
+  if (!sessionGlobal.__codexflowSessionSql)
+    sessionGlobal.__codexflowSessionSql = postgres(databaseUrl, { max: 1, idle_timeout: 20, connect_timeout: 10 });
+  return sessionGlobal.__codexflowSessionSql;
+}
+
+async function saveSession(input: { login: string; tokenCiphertext: string; expiresAt: string }) {
+  const sql = sessionSql();
+  if (!sql) return controlPlane().store.createGitHubSession(input);
+  const id = randomBytes(24).toString('base64url');
+  await sql`insert into codexflow.github_sessions (id, login, token_ciphertext, expires_at, created_at)
+    values (${id}, ${input.login}, ${input.tokenCiphertext}, ${input.expiresAt}, ${new Date().toISOString()})`;
+  return id;
+}
+
+async function loadSession(id: string): Promise<SessionRow | undefined> {
+  const sql = sessionSql();
+  if (!sql) {
+    const row = controlPlane().store.getGitHubSession(id);
+    return row ? { id: String(row.id), login: String(row.login), tokenCiphertext: String(row.tokenCiphertext), expiresAt: String(row.expiresAt) } : undefined;
+  }
+  const rows = await sql<SessionRow[]>`select id, login, token_ciphertext as "tokenCiphertext", expires_at as "expiresAt"
+    from codexflow.github_sessions where id = ${id} limit 1`;
+  return rows[0];
+}
+
+async function removeSession(id: string) {
+  const sql = sessionSql();
+  if (!sql) { controlPlane().store.deleteGitHubSession(id); return; }
+  await sql`delete from codexflow.github_sessions where id = ${id}`;
+}
 
 function configuration() {
   const clientId = process.env.GITHUB_OAUTH_CLIENT_ID;
@@ -51,7 +90,7 @@ export async function completeGitHubOAuth(origin: string, code: string, state: s
   if (!payload.access_token) throw new Error(payload.error_description ?? 'GitHub did not return an access token');
   const provider = new GitHubProvider(payload.access_token);
   const account = await provider.authenticate(payload.access_token);
-  const sessionId = controlPlane().store.createGitHubSession({ login: account.login, tokenCiphertext: encrypt(payload.access_token, secret), expiresAt: new Date(Date.now() + maxAge * 1000).toISOString() });
+  const sessionId = await saveSession({ login: account.login, tokenCiphertext: encrypt(payload.access_token, secret), expiresAt: new Date(Date.now() + maxAge * 1000).toISOString() });
   jar.set(sessionCookie, sessionId, { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', path: '/', maxAge });
   return account;
 }
@@ -59,13 +98,13 @@ export async function currentGitHubSession() {
   if (!oauthConfigured()) return undefined;
   const id = (await cookies()).get(sessionCookie)?.value;
   if (!id) return undefined;
-  const session = controlPlane().store.getGitHubSession(id);
+  const session = await loadSession(id);
   if (!session || String(session.expiresAt) <= new Date().toISOString()) return undefined;
   try { return { id, login: String(session.login), token: decrypt(String(session.tokenCiphertext), configuration().secret) }; }
-  catch { controlPlane().store.deleteGitHubSession(id); return undefined; }
+  catch { await removeSession(id); return undefined; }
 }
 export async function disconnectGitHub() {
   const jar = await cookies(); const id = jar.get(sessionCookie)?.value;
-  if (id) controlPlane().store.deleteGitHubSession(id);
+  if (id) await removeSession(id);
   jar.delete(sessionCookie);
 }
