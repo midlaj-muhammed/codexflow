@@ -19,6 +19,11 @@ ENV CODEXFLOW_DATABASE_PATH=/data/codexflow.sqlite
 ENV CODEXFLOW_PROJECT_ROOT=/data/projects
 ENV CODEXFLOW_WORKSPACE_ROOT=/data/workspaces
 
+# Make the default durable root available before the first SQLite-backed API
+# route is invoked. Render may mount a disk at /data; the command remains safe
+# when Docker creates the directory in a local smoke run.
+RUN mkdir -p /data/projects /data/workspaces
+
 EXPOSE 10000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]

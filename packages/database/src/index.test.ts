@@ -1,7 +1,22 @@
 import { describe, expect, it } from 'vitest';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { CodexFlowStore, openDatabase } from './index.js';
 
 describe('CodexFlowStore', () => {
+  it('creates a missing parent directory for a durable database path', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codexflow-db-'));
+    const path = join(root, 'data', 'codexflow.sqlite');
+    try {
+      const db = openDatabase(path);
+      expect(existsSync(path)).toBe(true);
+      db.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('migrates and persists the repository to task traceability chain', () => {
     const db = openDatabase();
     const store = new CodexFlowStore(db);

@@ -29,8 +29,14 @@ const text = (value: unknown, fallback = 'Not available') =>
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } });
-  const body = (await response.json()) as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(body.error?.message ?? 'Request failed');
+  const raw = await response.text();
+  let body: (T & { error?: { message?: string } }) | undefined;
+  if (raw) {
+    try { body = JSON.parse(raw) as T & { error?: { message?: string } }; }
+    catch { throw new Error(`Server returned invalid JSON for ${path} (HTTP ${response.status}). Check the server logs.`); }
+  }
+  if (!response.ok) throw new Error(body?.error?.message ?? `Request failed for ${path} (HTTP ${response.status}). Check the server logs.`);
+  if (!body) throw new Error(`Server returned an empty response for ${path} (HTTP ${response.status}). Check the server logs.`);
   return body;
 }
 

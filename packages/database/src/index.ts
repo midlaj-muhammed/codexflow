@@ -1,5 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { z } from 'zod';
 import {
   agentRoleSchema,
@@ -263,6 +265,11 @@ const mapReview = (row: Record<string, unknown>): ReviewRecord => ({
 });
 
 export function openDatabase(path = ':memory:'): Database {
+  // Deployments commonly point SQLite at a mounted data directory. Create the
+  // parent on first use so a valid writable mount does not fail merely because
+  // its target subdirectory has not been created by the container image.
+  if (path !== ':memory:' && !path.startsWith('file:'))
+    mkdirSync(dirname(path), { recursive: true });
   const db = new DatabaseSync(path);
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY)');
