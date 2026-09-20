@@ -132,19 +132,21 @@ export function ControlPlane() {
 
   async function importRepository(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(undefined);
-    const form = new FormData(event.currentTarget);
+    const target = event.currentTarget;
+    const form = new FormData(target);
     try {
       const result = await request<{ project: Json }>('/api/repositories/import', { method: 'POST', body: JSON.stringify({ localPath: form.get('localPath') }) });
       setSelectedProject(String(result.project.id));
-      event.currentTarget.reset(); await refresh();
+      target.reset(); await refresh();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Import failed'); } finally { setBusy(false); }
   }
   async function createTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault(); setBusy(true); setError(undefined);
-    const form = new FormData(event.currentTarget);
+    const target = event.currentTarget;
+    const form = new FormData(target);
     try {
       const result = await request<{ task: TaskDetail }>('/api/tasks', { method: 'POST', body: JSON.stringify({ projectId: form.get('projectId'), description: form.get('description') }) });
-      setDetail(result.task); event.currentTarget.reset(); await refresh();
+      setDetail(result.task); target.reset(); await refresh();
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'Task creation failed'); } finally { setBusy(false); }
   }
   async function loadGitHubRepositories() {
