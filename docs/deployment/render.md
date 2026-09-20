@@ -57,6 +57,7 @@ DATABASE_URL=<Supabase Session Pooler URL>
 GITHUB_OAUTH_CLIENT_ID=<GitHub OAuth client ID>
 GITHUB_OAUTH_CLIENT_SECRET=<GitHub OAuth client secret>
 CODEXFLOW_SESSION_SECRET=<long random secret>
+CODEXFLOW_PUBLIC_URL=https://YOUR-RENDER-SERVICE.onrender.com
 ```
 
 `DATABASE_URL` currently persists encrypted GitHub OAuth sessions. The main
@@ -70,7 +71,8 @@ must never be placed in browser storage.
 
 1. Open the Render `onrender.com` URL and confirm the landing page loads.
 2. Verify `https://YOUR-RENDER-URL/auth/github` redirects to GitHub.
-3. Update the GitHub OAuth App homepage URL and callback URL:
+3. Update the GitHub OAuth App homepage URL and callback URL, and ensure
+   `CODEXFLOW_PUBLIC_URL` is exactly the same public origin (without a path):
 
    ```text
    https://YOUR-RENDER-URL/auth/github/callback

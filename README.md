@@ -469,6 +469,7 @@ never commit real values.
 | `GITHUB_OAUTH_CLIENT_ID`     | Interactive GitHub sign-in             | GitHub OAuth app client ID.                                                            |
 | `GITHUB_OAUTH_CLIENT_SECRET` | Interactive GitHub sign-in             | GitHub OAuth app client secret; server-only.                                           |
 | `CODEXFLOW_SESSION_SECRET`   | Interactive GitHub sign-in             | Long random server-side session/encryption secret.                                     |
+| `CODEXFLOW_PUBLIC_URL`       | OAuth behind a reverse proxy           | Exact public GitHub-registered origin; prevents use of an internal listener URL.       |
 | `DATABASE_URL`               | PostgreSQL-backed OAuth sessions       | PostgreSQL/Supabase connection URL for encrypted OAuth session rows only.              |
 | `CODEXFLOW_REAL_OPENAI_E2E`  | Real OpenAI E2E                        | Explicit opt-in for the external provider suite.                                       |
 | `CODEXFLOW_GITHUB_E2E_*`     | Real GitHub delivery E2E               | Disposable repository, token, and workspace configuration described in `.env.example`. |
@@ -562,8 +563,8 @@ CODEXFLOW_WORKSPACE_ROOT=/data/workspaces
 
 For OAuth-backed GitHub repository browsing, also configure
 `DATABASE_URL`, `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, and
-`CODEXFLOW_SESSION_SECRET`. Keep the deployment to one disk-owning instance
-while the control-plane store is local SQLite.
+`CODEXFLOW_SESSION_SECRET`, plus `CODEXFLOW_PUBLIC_URL`. Keep the deployment
+to one disk-owning instance while the control-plane store is local SQLite.
 
 Read the complete guide: **[CodexFlow on Render](docs/deployment/render.md)**.
 It covers the Docker runtime, disk, health check, OAuth callback setup, and
